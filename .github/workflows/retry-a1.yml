@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: oci-a1-capacity-retry
@@ -68,3 +69,81 @@ jobs:
       - name: Orchestrate A1 retries
         shell: bash
         run: scripts/orchestrate-a1.sh
+
+      - name: Notify once when the A1 target is acquired
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          instances="$(python scripts/list-a1-instances.py "$OCI_A1_COMPARTMENT_ID")"
+          jq -e '.data | type == "array"' >/dev/null <<<"$instances"
+
+          classification="$(jq -c \
+            --arg core "hermes-core-01" \
+            --arg small01 "hermes-a1-small-01" \
+            --arg small02 "hermes-a1-small-02" '
+            def cfg: .["shape-config"];
+            [ .data[] ] as $a1 |
+            {
+              core:    [ $a1[] | select(.["display-name"] == $core and (cfg.ocpus | tonumber) == 2 and (cfg."memory-in-gbs" | tonumber) == 12) ],
+              small01: [ $a1[] | select(.["display-name"] == $small01 and (cfg.ocpus | tonumber) == 1 and (cfg."memory-in-gbs" | tonumber) == 6) ],
+              small02: [ $a1[] | select(.["display-name"] == $small02 and (cfg.ocpus | tonumber) == 1 and (cfg."memory-in-gbs" | tonumber) == 6) ],
+              total: $a1
+            } |
+            . + {expected: (.core + .small01 + .small02 | length)}
+          ' <<<"$instances")"
+
+          total="$(jq -r '.total | length' <<<"$classification")"
+          expected="$(jq -r '.expected' <<<"$classification")"
+          if [[ "$total" != "$expected" ]]; then
+            echo "Unexpected A1 instance detected; skipping acquisition notification."
+            exit 0
+          fi
+
+          core_count="$(jq -r '.core | length' <<<"$classification")"
+          small01_count="$(jq -r '.small01 | length' <<<"$classification")"
+          small02_count="$(jq -r '.small02 | length' <<<"$classification")"
+
+          if [[ "$core_count" != 1 && ! ( "$small01_count" == 1 && "$small02_count" == 1 ) ]]; then
+            echo "Always Free A1 target is not fully satisfied yet; no notification."
+            exit 0
+          fi
+
+          title='🎉 OCI A1無料枠の取得に成功しました'
+          search_response="$(curl -fsS --get \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --data-urlencode "q=repo:$GITHUB_REPOSITORY is:issue in:title \"$title\"" \
+            https://api.github.com/search/issues)"
+
+          if jq -e --arg title "$title" '.items[]? | select(.title == $title)' >/dev/null <<<"$search_response"; then
+            echo "Acquisition notification issue already exists; no duplicate created."
+            exit 0
+          fi
+
+          body=$(cat <<'EOF'
+          @AkiAvis
+
+          Oracle Cloud Singapore で Always Free A1 の目標構成（合計 2 OCPU / 12 GB）の取得を確認しました。🎉
+
+          - `hermes-core-01`（2 OCPU / 12 GB）、または
+          - `hermes-a1-small-01` + `hermes-a1-small-02`（各 1 OCPU / 6 GB）
+
+          のいずれかが揃っています。
+
+          **Cloudflare の `oci-a1-retry-trigger` Cron を停止してください。**
+          EOF
+          )
+
+          payload="$(jq -n --arg title "$title" --arg body "$body" '{title:$title,body:$body}')"
+          created="$(curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/"$GITHUB_REPOSITORY"/issues \
+            -d "$payload")"
+
+          echo "Created acquisition notification issue: $(jq -r '.html_url' <<<"$created")"
