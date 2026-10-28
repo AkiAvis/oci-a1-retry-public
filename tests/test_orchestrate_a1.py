@@ -77,6 +77,82 @@ FULL_CAPACITY_LOG = "\n".join(
     ]
 )
 
+
+def _bracket_row(timestamp: str, level: str, message: str = "") -> str:
+    return f"[{timestamp}] {level} - {message}"
+
+
+BRACKET_CAPACITY_LOG = "\n".join(
+    [
+        _bracket_row("2026/10/28 10:00:00", "INFO", "Synthetic provider prelude"),
+        _bracket_row("2026/10/28 10:00:01", "WARN", "Synthetic warning retained"),
+        _bracket_row(
+            "2026/10/28 10:00:02",
+            "ERROR",
+            "Error: 500-InternalError, Out of host capacity.",
+        ),
+        _bracket_row(
+            "2026/10/28 10:00:02",
+            "INFO",
+            "Suggestion: The service for this resource encountered an error.",
+        ),
+        _bracket_row(
+            "2026/10/28 10:00:02",
+            "INFO",
+            "Documentation: https://registry.terraform.io/providers/oracle/oci/latest/docs/resources/core_instance",
+        ),
+        _bracket_row("2026/10/28 10:00:02", "INFO", "Provider version: 9.11.0"),
+        _bracket_row("2026/10/28 10:00:02", "INFO", "Service: Core Instance"),
+        _bracket_row("2026/10/28 10:00:02", "INFO", "Operation Name: LaunchInstance"),
+        _bracket_row("2026/10/28 10:00:02", "INFO", "Correlation marker: synthetic-marker"),
+    ]
+)
+
+
+def _bracket_provider_attempt(started_at: str, failed_at: str) -> list[str]:
+    return [
+        _bracket_row(started_at, "INFO", "Getting providers from registry and/or custom terraform providers"),
+        _bracket_row(started_at, "INFO"),
+        _bracket_row(started_at, "INFO", "Initializing provider plugins..."),
+        _bracket_row(started_at, "INFO", "- Finding latest version of oracle/oci..."),
+        _bracket_row(failed_at, "ERROR", "Error: Failed to install provider"),
+        _bracket_row(failed_at, "INFO"),
+        _bracket_row(
+            failed_at,
+            "INFO",
+            "Error while installing oracle/oci v8.26.0: could not query provider registry",
+        ),
+        _bracket_row(
+            failed_at,
+            "INFO",
+            "for registry.terraform.io/oracle/oci: failed to retrieve authentication",
+        ),
+        _bracket_row(failed_at, "INFO"),
+        _bracket_row(
+            failed_at,
+            "INFO",
+            "checksums for provider: the request failed after 2 attempts, please try again",
+        ),
+        _bracket_row(failed_at, "INFO"),
+        _bracket_row(failed_at, "INFO", "later: Get"),
+        _bracket_row(
+            failed_at,
+            "INFO",
+            '"https://github.com/oracle/terraform-provider-oci/releases/download/v8.26.0/terraform-provider-oci_8.26.0_SHA256SUMS":',
+        ),
+        _bracket_row(
+            failed_at,
+            "INFO",
+            "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+        ),
+    ]
+
+
+BRACKET_PROVIDER_TIMEOUT_LOG = "\r\n".join(
+    _bracket_provider_attempt("2026/10/28 10:00:00", "2026/10/28 10:00:01")
+    + _bracket_provider_attempt("2026/10/28 10:00:02", "2026/10/28 10:00:03")
+)
+
 _CAPACITY_ERROR_TAIL = CAPACITY_LOG.split(
     "2026/10/26 17:09:36\tERROR\t", 1
 )[1]
@@ -567,6 +643,179 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         creates = self.create_calls(calls)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
+
+    def test_bracket_timestamp_capacity_routes_core_then_small01(self):
+        result, calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-bracket-old-capacity", logs=BRACKET_CAPACITY_LOG)],
+                "stack-small-01": [_job("job-small01-old-timeout", logs=SMALL01_CONSOLE_LOG)],
+            },
+            create={
+                "stack-core": {
+                    "id": "job-bracket-core-new",
+                    "state": "FAILED",
+                    "logs": BRACKET_CAPACITY_LOG,
+                },
+                "stack-small-01": {
+                    "id": "job-bracket-small01-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            },
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
+
+    def test_bracket_timestamp_provider_timeout_preserves_retries_blank_payloads_and_crlf(self):
+        result, calls = self.run_orchestrator(
+            inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+            jobs={
+                "stack-small-02": [
+                    _job("job-bracket-timeout", logs=BRACKET_PROVIDER_TIMEOUT_LOG)
+                ]
+            },
+            create={
+                "stack-small-02": {
+                    "id": "job-bracket-small02-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                }
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("diagnostic=provider_checksum_download_timeout", result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-small-02"],
+        )
+
+    def test_bracket_credentials_and_account_markers_fail_closed_before_and_after_known_blocks(self):
+        markers = (
+            _bracket_row("2026/10/28 10:00:04", "INFO", "Credentials rejected"),
+            _bracket_row("2026/10/28 10:00:04", "ERROR", "AccountSuspended"),
+        )
+        for marker in markers:
+            for block_name, block_log in (
+                ("capacity", BRACKET_CAPACITY_LOG),
+                ("provider", BRACKET_PROVIDER_TIMEOUT_LOG),
+            ):
+                separator = "\r\n" if "\r\n" in block_log else "\n"
+                for position in ("before", "after"):
+                    with self.subTest(marker=marker, block_name=block_name, position=position):
+                        mixed_log = (
+                            marker + separator + block_log
+                            if position == "before"
+                            else block_log + separator + marker
+                        )
+                        if block_name == "capacity":
+                            result, calls = self.run_orchestrator(
+                                create={
+                                    "stack-core": {
+                                        "id": "job-bracket-marker-core",
+                                        "state": "FAILED",
+                                        "logs": mixed_log,
+                                    },
+                                    "stack-small-01": {
+                                        "id": "job-bracket-marker-small01",
+                                        "state": "SUCCEEDED",
+                                        "logs": "",
+                                    },
+                                }
+                            )
+                        else:
+                            result, calls = self.run_orchestrator(
+                                inventory={"data": []},
+                                jobs={
+                                    "stack-core": [
+                                        _job("job-bracket-marker-old-core", logs=CAPACITY_LOG)
+                                    ],
+                                    "stack-small-01": [
+                                        _job("job-bracket-marker-small01", logs=mixed_log)
+                                    ],
+                                },
+                                create={
+                                    "stack-core": {
+                                        "id": "job-bracket-marker-core-new",
+                                        "state": "FAILED",
+                                        "logs": CAPACITY_LOG,
+                                    },
+                                    "stack-small-01": {
+                                        "id": "job-bracket-marker-small01-new",
+                                        "state": "SUCCEEDED",
+                                        "logs": "",
+                                    },
+                                },
+                            )
+
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(
+                            [call[4] for call in self.create_calls(calls)],
+                            ["stack-core"],
+                        )
+
+    def test_bracket_unknown_error_or_info_after_known_block_stops(self):
+        suffixes = (
+            "Error: Unexpected provider failure",
+            _bracket_row("2026/10/28 10:00:04", "ERROR", "Unexpected provider failure"),
+            _bracket_row("2026/10/28 10:00:04", "INFO", "Unexpected provider failure"),
+        )
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
+                result, calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {
+                            "id": "job-bracket-unknown-core",
+                            "state": "FAILED",
+                            "logs": BRACKET_CAPACITY_LOG + "\n" + suffix,
+                        },
+                        "stack-small-01": {
+                            "id": "job-bracket-unknown-small01",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    }
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-core"],
+                )
+
+    def test_bracket_unknown_level_or_missing_delimiter_stops(self):
+        malformed_rows = (
+            _bracket_row(
+                "2026/10/28 10:00:04",
+                "DEBUG",
+                "Error: 500-InternalError, Out of host capacity.",
+            ),
+            "[2026/10/28 10:00:04] INFO Error: 500-InternalError, Out of host capacity.",
+        )
+        for malformed_row in malformed_rows:
+            with self.subTest(malformed_row=malformed_row):
+                result, calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {
+                            "id": "job-bracket-malformed-core",
+                            "state": "FAILED",
+                            "logs": BRACKET_CAPACITY_LOG + "\n" + malformed_row,
+                        },
+                        "stack-small-01": {
+                            "id": "job-bracket-malformed-small01",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    }
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-core"],
+                )
 
     def test_known_terraform_capacity_diagnostics_remain_accepted(self):
         result, calls = self.run_orchestrator(

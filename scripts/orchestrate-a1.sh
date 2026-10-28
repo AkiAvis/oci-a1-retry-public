@@ -276,8 +276,16 @@ classify_failure_records() {
       gsub(/\r/, "", raw)
       level = ""
       message = raw
+      bracket_timestamp_prefix = "^\\[[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\][[:space:]]+"
+      bracket_record_prefix = bracket_timestamp_prefix "(INFO|WARN|ERROR)[[:space:]]-[[:space:]]"
       timestamp_prefix = "^[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9][[:space:]]+"
-      if (raw ~ timestamp_prefix "[A-Z]+([[:space:]]|$)") {
+      if (raw ~ bracket_record_prefix) {
+        level = raw
+        sub(bracket_timestamp_prefix, "", level)
+        sub(/[[:space:]]-[[:space:]].*$/, "", level)
+        message = raw
+        sub(bracket_record_prefix, "", message)
+      } else if (raw ~ timestamp_prefix "[A-Z]+([[:space:]]|$)") {
         level = raw
         sub(timestamp_prefix, "", level)
         sub(/[[:space:]].*$/, "", level)
