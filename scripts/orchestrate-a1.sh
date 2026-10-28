@@ -98,6 +98,145 @@ unsafe_failure_markers_present() {
   grep -Eqi 'TooManyRequests|Too many requests|HTTP[[:space:]]+429|"status"[[:space:]]*:[[:space:]]*429|quota|limit exceeded|permission denied|not authorized|notauthorizedornotfound|forbidden|unauthorized|authentication failed|authentication error|(^|[^0-9])401([^0-9]|$)|(^|[^0-9])403([^0-9]|$)' <<<"$logs"
 }
 
+core_mixed_serious_error_present() {
+  local logs="$1" parser_result
+  if parser_result="$(awk '
+    BEGIN {
+      pending_level = ""
+      serious = 0
+    }
+
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    function normalized(value) {
+      value = tolower(trim(value))
+      gsub(/[[:space:]]+/, " ", value)
+      sub(/[.][[:space:]]*$/, "", value)
+      return value
+    }
+
+    function is_capacity_error(message) {
+      message = tolower(trim(message))
+      return message ~ /^error:[[:space:]]*500-internalerror,[[:space:]]*out of host capacity[.]?$/
+    }
+
+    function is_explicit_auth_info(message, value) {
+      value = normalized(message)
+      return value == "credentials rejected" ||
+             value == "accountsuspended" ||
+             value == "account suspended"
+    }
+
+    function inspect_record(level, message, lower_message) {
+      message = trim(message)
+      if (message == "") return
+      lower_message = tolower(message)
+
+      # Keep the exact provider capacity diagnostic usable. Any other
+      # explicit Error:/ERROR record is a separate failure signal.
+      if (lower_message ~ /^error:[[:space:]]*/ && !is_capacity_error(message)) {
+        serious = 1
+        return
+      }
+      if (level == "ERROR" && !is_capacity_error(message)) {
+        serious = 1
+        return
+      }
+      if (level == "INFO" && is_explicit_auth_info(message)) {
+        serious = 1
+      }
+    }
+
+    {
+      raw = $0
+      sub(/\r$/, "", raw)
+
+      # Structured records are not part of the supported text renderings.
+      # An explicit structured ERROR must not be hidden by a capacity marker.
+      if (raw ~ /^[[:space:]]*\{/) {
+        if (tolower(raw) ~ /"level"[[:space:]]*:[[:space:]]*"error"/ ||
+            tolower(raw) ~ /"message"[[:space:]]*:[[:space:]]*"[[:space:]]*error:/) {
+          serious = 1
+        }
+        pending_level = ""
+        next
+      }
+
+      bracket_prefix = "^\\[[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\][[:space:]]+"
+      bracket_record_prefix = bracket_prefix "(INFO|WARN|ERROR)[[:space:]]-[[:space:]]"
+      if (raw ~ bracket_record_prefix) {
+        parsed = raw
+        sub(bracket_prefix, "", parsed)
+        level = parsed
+        sub(/[[:space:]]-[[:space:]].*$/, "", level)
+        message = raw
+        sub(bracket_record_prefix, "", message)
+        inspect_record(level, message)
+        pending_level = ""
+        next
+      }
+
+      timestamp_prefix = "^[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9][[:space:]]+"
+      if (raw ~ timestamp_prefix "(INFO|WARN|ERROR)([[:space:]]|$)") {
+        parsed = raw
+        sub(timestamp_prefix, "", parsed)
+        level = parsed
+        sub(/[[:space:]].*$/, "", level)
+        message = parsed
+        sub(/^[A-Z]+[[:space:]]*/, "", message)
+        if (message == "") {
+          pending_level = level
+        } else {
+          inspect_record(level, message)
+          pending_level = ""
+        }
+        next
+      }
+
+      if (raw ~ /^ERROR[[:space:]]*-[[:space:]]*/) {
+        message = raw
+        sub(/^ERROR[[:space:]]*-[[:space:]]*/, "", message)
+        inspect_record("ERROR", message)
+        pending_level = ""
+        next
+      }
+
+      if (raw ~ /^ERROR([[:space:]]|$)/) {
+        message = raw
+        sub(/^ERROR[[:space:]]*/, "", message)
+        inspect_record("ERROR", message)
+        pending_level = ""
+        next
+      }
+
+      if (trim(raw) == "") next
+      if (pending_level != "") {
+        inspect_record(pending_level, raw)
+        pending_level = ""
+      } else {
+        inspect_record("", raw)
+      }
+    }
+
+    END {
+      printf "%s", serious ? "serious" : "clean"
+      exit 0
+    }
+  ' 2>/dev/null <<<"$logs")"; then
+    case "$parser_result" in
+      serious) return 0 ;;
+      clean) return 1 ;;
+      *) return 2 ;;
+    esac
+  else
+    return 2
+  fi
+}
+
 classify_failure_records() {
   local logs="$1"
   awk '
@@ -649,18 +788,25 @@ provider_timeout_history_allows() {
   return 0
 }
 
-# Core intentionally retains baseline marker-only capacity recognition. Mixed
-# core errors remain a documented known-unsolved safety limitation; small paths
-# continue through the strict provider-timeout classifier.
+# Core keeps marker-based capacity recognition, with one bounded additional
+# guard for explicit serious records mixed into that capacity log. Arbitrary
+# INFO/WARN text remains outside this guard and is documented as ambiguous.
 core_capacity_history_allows() {
-  local label="$1" expected_state="$2" latest="$3" logs
+  local label="$1" expected_state="$2" latest="$3" logs parser_rc
 
   logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$latest" --output json --query data --raw-output 2>&1)" || stop_for_failure "$label" "$expected_state" "$latest" log_unavailable
-  if grep -Fqi 'Out of host capacity' <<<"$logs"; then
-    echo "Observed $label Apply history: diagnostic=capacity state=$expected_state job=$(safe_job_id "$latest")." >&2
-    return 0
+  grep -Fqi 'Out of host capacity' <<<"$logs" || stop_for_failure "$label" "$expected_state" "$latest" unknown
+  if core_mixed_serious_error_present "$logs"; then
+    stop_for_failure "$label" "$expected_state" "$latest" mixed_serious_error
+  else
+    parser_rc=$?
   fi
-  stop_for_failure "$label" "$expected_state" "$latest" unknown
+  case "$parser_rc" in
+    1) ;;
+    *) stop_for_failure "$label" "$expected_state" "$latest" core_safety_parser_failed ;;
+  esac
+  echo "Observed $label Apply history: diagnostic=capacity state=$expected_state job=$(safe_job_id "$latest")." >&2
+  return 0
 }
 
 ensure_retry_allowed() {
@@ -782,9 +928,18 @@ wait_for_terminal() {
 }
 
 failure_is_capacity() {
-  local job_id="$1" logs
+  local job_id="$1" logs parser_rc
   logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" --output json --query data --raw-output 2>&1)" || fail "Could not read failed-job logs."
-  grep -Fqi 'Out of host capacity' <<<"$logs"
+  grep -Fqi 'Out of host capacity' <<<"$logs" || return 1
+  if core_mixed_serious_error_present "$logs"; then
+    return 1
+  else
+    parser_rc=$?
+  fi
+  case "$parser_rc" in
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 for stack_id in "$OCI_CORE_STACK_ID" "$OCI_SMALL_01_STACK_ID" "$OCI_SMALL_02_STACK_ID"; do

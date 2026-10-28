@@ -420,6 +420,21 @@ def _make_executable(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
+def _fake_awk_script(stdout: str = "", stderr: str = "", status: int = 0) -> str:
+    newline = chr(10)
+    return newline.join(
+        [
+            "#!/usr/bin/bash",
+            "/usr/bin/python3 - <<'PY'",
+            "import sys",
+            f"sys.stdout.write({json.dumps(stdout)})",
+            f"sys.stderr.write({json.dumps(stderr)})",
+            "PY",
+            f"exit {status}",
+        ]
+    ) + newline
+
+
 def _job(job_id: str, state: str = "FAILED", operation: str = "APPLY", logs: str = "") -> dict:
     return {
         "id": job_id,
@@ -791,7 +806,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("provider_timeout_budget_exhausted", result.stderr)
         self.assertFalse(self.create_calls(calls))
-    def test_known_unsolved_core_baseline_bypass_mixed_capacity_and_provider_timeout(self):
+    def test_core_bounded_guard_stops_mixed_capacity_and_provider_timeout(self):
         mixed_log = "\n".join(["Out of host capacity", TIMEOUT_LOG])
         result, calls = self.run_orchestrator(
             create={
@@ -808,10 +823,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
     def test_known_unsolved_core_baseline_bypass_partial_provider_error_with_capacity(self):
@@ -867,20 +882,20 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertEqual(len(self.create_calls(calls)), 1)
         self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
 
-    def test_known_unsolved_core_baseline_bypass_explicit_prelude_failures(self):
+    def test_core_explicit_preludes_stop_only_for_bounded_serious_markers(self):
         preludes = (
-            "2026/10/26 17:09:35\tINFO\tCredentials rejected",
-            "2026/10/26 17:09:35\tINFO\tAccount is disabled",
-            "2026/10/26 17:09:35\tINFO\tAccess revoked",
-            "2026/10/26 17:09:35\tINFO\t  cReDeNtIaLs\t ReJeCtEd  ",
-            "2026/10/26 17:09:35\tINFO\t ACCOUNT   IS\tDISABLED ",
-            "2026/10/26 17:09:35\tINFO\t aCcEsS\t ReVoKeD ",
-            "Error: AccountSuspended",
-            "ERROR: AccountSuspended",
-            "error: AccountSuspended",
-            "2026/10/26 17:09:35\tERROR\tAccountSuspended",
+            ("2026/10/26 17:09:35\tINFO\tCredentials rejected", True),
+            ("2026/10/26 17:09:35\tINFO\tAccount is disabled", False),
+            ("2026/10/26 17:09:35\tINFO\tAccess revoked", False),
+            ("2026/10/26 17:09:35\tINFO\t  cReDeNtIaLs\t ReJeCtEd  ", True),
+            ("2026/10/26 17:09:35\tINFO\t ACCOUNT   IS\tDISABLED ", False),
+            ("2026/10/26 17:09:35\tINFO\t aCcEsS\t ReVoKeD ", False),
+            ("Error: AccountSuspended", True),
+            ("ERROR: AccountSuspended", True),
+            ("error: AccountSuspended", True),
+            ("2026/10/26 17:09:35\tERROR\tAccountSuspended", True),
         )
-        for prelude in preludes:
+        for prelude, should_stop in preludes:
             with self.subTest(prelude=prelude):
                 mixed_log = prelude + "\n" + CAPACITY_LOG
                 result, calls = self.run_orchestrator(
@@ -889,20 +904,31 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         "stack-small-01": {"id": "job-small-new", "state": "SUCCEEDED", "logs": ""},
                     }
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    [call[4] for call in self.create_calls(calls)],
-                    ["stack-core", "stack-small-01"],
-                )
+                if should_stop:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core"],
+                    )
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core", "stack-small-01"],
+                    )
 
                 historical, historical_calls = self.run_orchestrator(
                     jobs={"stack-core": [_job("job-old-mixed", logs=mixed_log)]},
                 )
-                self.assertEqual(historical.returncode, 0, historical.stderr)
-                self.assertEqual(
-                    [call[4] for call in self.create_calls(historical_calls)],
-                    ["stack-core"],
-                )
+                if should_stop:
+                    self.assertNotEqual(historical.returncode, 0, historical.stderr)
+                    self.assertFalse(self.create_calls(historical_calls))
+                else:
+                    self.assertEqual(historical.returncode, 0, historical.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(historical_calls)],
+                        ["stack-core"],
+                    )
 
     def test_realistic_capacity_log_allows_core_retry_and_small01_fallback(self):
         result, calls = self.run_orchestrator(
@@ -973,7 +999,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-small-02"],
         )
 
-    def test_known_unsolved_core_baseline_bypass_but_small_provider_markers_still_fail_closed(self):
+    def test_core_bounded_guard_and_small_provider_markers_still_fail_closed(self):
         markers = (
             _bracket_row("2026/10/28 10:00:04", "INFO", "Credentials rejected"),
             _bracket_row("2026/10/28 10:00:04", "ERROR", "AccountSuspended"),
@@ -1032,10 +1058,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                             )
 
                         if block_name == "capacity":
-                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertNotEqual(result.returncode, 0, result.stderr)
                             self.assertEqual(
                                 [call[4] for call in self.create_calls(calls)],
-                                ["stack-core", "stack-small-01"],
+                                ["stack-core"],
                             )
                         else:
                             self.assertNotEqual(result.returncode, 0)
@@ -1044,13 +1070,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                                 ["stack-core"],
                             )
 
-    def test_known_unsolved_core_baseline_bypass_bracket_unknown_after_capacity_block(self):
+    def test_core_bounded_guard_stops_explicit_errors_but_keeps_unknown_info_unsolved(self):
         suffixes = (
-            "Error: Unexpected provider failure",
-            _bracket_row("2026/10/28 10:00:04", "ERROR", "Unexpected provider failure"),
-            _bracket_row("2026/10/28 10:00:04", "INFO", "Unexpected provider failure"),
+            ("Error: Unexpected provider failure", True),
+            (_bracket_row("2026/10/28 10:00:04", "ERROR", "Unexpected provider failure"), True),
+            (_bracket_row("2026/10/28 10:00:04", "INFO", "Unexpected provider failure"), False),
         )
-        for suffix in suffixes:
+        for suffix, should_stop in suffixes:
             with self.subTest(suffix=suffix):
                 result, calls = self.run_orchestrator(
                     create={
@@ -1067,11 +1093,18 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    [call[4] for call in self.create_calls(calls)],
-                    ["stack-core", "stack-small-01"],
-                )
+                if should_stop:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core"],
+                    )
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core", "stack-small-01"],
+                    )
 
     def test_known_unsolved_core_baseline_bypass_bracket_malformed_capacity_marker(self):
         malformed_rows = (
@@ -1326,6 +1359,278 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             [call[4] for call in self.create_calls(baseline_calls)],
             ["stack-core", "stack-small-01"],
         )
+
+    def test_core_capacity_stops_explicit_mixed_serious_records_in_history_and_fresh_failure(self):
+        core_log, _ = _load_private_downloaded_logs()
+        records = (
+            _bracket_row(
+                "2026/10/28 04:09:38",
+                "ERROR",
+                "Error: NotAuthorizedOrNotFound",
+            ),
+            _bracket_row(
+                "2026/10/28 04:09:38",
+                "ERROR",
+                "Error: InvalidParameter",
+            ),
+            _bracket_row(
+                "2026/10/28 04:09:38",
+                "ERROR",
+                "Unexpected provider failure",
+            ),
+            "Error: NotAuthorizedOrNotFound",
+            STRUCTURED_ERROR_RECORD,
+            _bracket_row("2026/10/28 04:09:38", "INFO", "Credentials rejected"),
+            _bracket_row("2026/10/28 04:09:38", "INFO", "AccountSuspended"),
+        )
+
+        for record in records:
+            for position in ("before", "after"):
+                with self.subTest(record=record, position=position):
+                    mixed_log = (
+                        record + "\n" + core_log
+                        if position == "before"
+                        else core_log + "\n" + record
+                    )
+                    historical_result, historical_calls = self.run_orchestrator(
+                        jobs={
+                            "stack-core": [
+                                _job("job-core-history-mixed-error", logs=mixed_log)
+                            ]
+                        },
+                        create={
+                            "stack-core": {
+                                "id": "job-core-history-should-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                            "stack-small-01": {
+                                "id": "job-small-history-should-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        },
+                    )
+                    self.assertNotEqual(historical_result.returncode, 0)
+                    self.assertFalse(self.create_calls(historical_calls))
+
+                    fresh_result, fresh_calls = self.run_orchestrator(
+                        create={
+                            "stack-core": {
+                                "id": "job-core-fresh-mixed-error",
+                                "state": "FAILED",
+                                "logs": mixed_log,
+                            },
+                            "stack-small-01": {
+                                "id": "job-small-fresh-should-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        }
+                    )
+                    self.assertNotEqual(fresh_result.returncode, 0)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(fresh_calls)],
+                        ["stack-core"],
+                    )
+
+    def test_core_safety_parser_nonzero_status_fails_closed_for_history_and_fresh_failure(self):
+        core_log, _ = _load_private_downloaded_logs()
+        for status in (1, 2, 126, 127):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=SCRATCH) as awk_dir:
+                _make_executable(
+                    Path(awk_dir) / "awk",
+                    _fake_awk_script(
+                        stdout="unexpected parser stdout" + chr(10),
+                        stderr="unexpected parser stderr" + chr(10),
+                        status=status,
+                    ),
+                )
+                history_result, history_calls = self.run_orchestrator(
+                    jobs={
+                        "stack-core": [
+                            _job(f"job-core-history-awk-{status}", logs=core_log)
+                        ]
+                    },
+                    extra_env={"PATH": f"{awk_dir}:/usr/bin:/bin"},
+                )
+
+                self.assertEqual(history_result.returncode, 1)
+                self.assertEqual(history_result.stdout, "")
+                self.assertEqual(
+                    history_result.stderr,
+                    "Latest core 2/12 Apply stopped: "
+                    "diagnostic=core_safety_parser_failed state=FAILED "
+                    f"job=job-core-history-awk-{status}." + chr(10),
+                )
+                self.assertFalse(self.create_calls(history_calls))
+
+                fresh_result, fresh_calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {
+                            "id": f"job-core-fresh-awk-{status}",
+                            "state": "FAILED",
+                            "logs": core_log,
+                        },
+                        "stack-small-01": {
+                            "id": f"job-small-fresh-awk-{status}",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    },
+                    extra_env={"PATH": f"{awk_dir}:/usr/bin:/bin"},
+                )
+
+                self.assertEqual(fresh_result.returncode, 1)
+                self.assertEqual(
+                    fresh_result.stdout,
+                    f"Started core 2/12 Apply job: job-core-fresh-awk-{status}" + chr(10),
+                )
+                self.assertEqual(
+                    fresh_result.stderr,
+                    "ERROR: Core Apply failed for a reason other than host capacity; retry is stopped." + chr(10),
+                )
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(fresh_calls)],
+                    ["stack-core"],
+                )
+
+    def test_core_safety_parser_requires_exact_success_token_for_history_and_fresh_failure(self):
+        core_log, _ = _load_private_downloaded_logs()
+        malformed_outputs = (
+            "",
+            "unexpected" + chr(10),
+            "clean" + chr(10) + "parser noise" + chr(10),
+            "parser noise" + chr(10) + "clean" + chr(10),
+            " clean" + chr(10),
+        )
+        for index, parser_output in enumerate(malformed_outputs):
+            with self.subTest(parser_output=parser_output), tempfile.TemporaryDirectory(dir=SCRATCH) as awk_dir:
+                _make_executable(
+                    Path(awk_dir) / "awk",
+                    _fake_awk_script(
+                        stdout=parser_output,
+                        stderr="unexpected parser stderr" + chr(10),
+                        status=0,
+                    ),
+                )
+                history_result, history_calls = self.run_orchestrator(
+                    jobs={
+                        "stack-core": [
+                            _job(f"job-core-history-malformed-{index}", logs=core_log)
+                        ]
+                    },
+                    extra_env={"PATH": f"{awk_dir}:/usr/bin:/bin"},
+                )
+
+                self.assertEqual(history_result.returncode, 1)
+                self.assertEqual(history_result.stdout, "")
+                self.assertEqual(
+                    history_result.stderr,
+                    "Latest core 2/12 Apply stopped: "
+                    "diagnostic=core_safety_parser_failed state=FAILED "
+                    f"job=job-core-history-malformed-{index}." + chr(10),
+                )
+                self.assertFalse(self.create_calls(history_calls))
+
+                fresh_result, fresh_calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {
+                            "id": f"job-core-fresh-malformed-{index}",
+                            "state": "FAILED",
+                            "logs": core_log,
+                        },
+                        "stack-small-01": {
+                            "id": f"job-small-fresh-malformed-{index}",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    },
+                    extra_env={"PATH": f"{awk_dir}:/usr/bin:/bin"},
+                )
+
+                self.assertEqual(fresh_result.returncode, 1)
+                self.assertEqual(
+                    fresh_result.stdout,
+                    f"Started core 2/12 Apply job: job-core-fresh-malformed-{index}" + chr(10),
+                )
+                self.assertEqual(
+                    fresh_result.stderr,
+                    "ERROR: Core Apply failed for a reason other than host capacity; retry is stopped." + chr(10),
+                )
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(fresh_calls)],
+                    ["stack-core"],
+                )
+
+    def test_core_safety_parser_clean_and_serious_tokens_preserve_expected_paths(self):
+        core_log, _ = _load_private_downloaded_logs()
+        for token, expected_history_creates, expected_fresh_creates, expected_history_stderr in (
+            ("clean", ["stack-core"], ["stack-core", "stack-small-01"], None),
+            ("serious", [], ["stack-core"], "mixed_serious_error"),
+        ):
+            with self.subTest(token=token), tempfile.TemporaryDirectory(dir=SCRATCH) as awk_dir:
+                _make_executable(
+                    Path(awk_dir) / "awk",
+                    _fake_awk_script(stdout=token, status=0),
+                )
+                history_result, history_calls = self.run_orchestrator(
+                    jobs={"stack-core": [_job(f"job-core-history-{token}", logs=core_log)]},
+                    extra_env={"PATH": f"{awk_dir}:/usr/bin:/bin"},
+                )
+                self.assertEqual(history_result.returncode, 0 if token == "clean" else 1)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(history_calls)],
+                    expected_history_creates,
+                )
+                if expected_history_stderr is None:
+                    self.assertEqual(history_result.stdout, "Started core 2/12 Apply job: job-new" + chr(10))
+                else:
+                    self.assertEqual(history_result.stdout, "")
+                    self.assertEqual(
+                        history_result.stderr,
+                        "Latest core 2/12 Apply stopped: "
+                        f"diagnostic={expected_history_stderr} state=FAILED "
+                        f"job=job-core-history-{token}." + chr(10),
+                    )
+
+                fresh_result, fresh_calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {
+                            "id": f"job-core-fresh-{token}",
+                            "state": "FAILED",
+                            "logs": core_log,
+                        },
+                        "stack-small-01": {
+                            "id": f"job-small-fresh-{token}",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    },
+                    extra_env={"PATH": f"{awk_dir}:/usr/bin:/bin"},
+                )
+                self.assertEqual(fresh_result.returncode, 0 if token == "clean" else 1)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(fresh_calls)],
+                    expected_fresh_creates,
+                )
+                expected_fresh_stdout = (
+                    "Started core 2/12 Apply job: "
+                    f"job-core-fresh-{token}"
+                    + chr(10)
+                )
+                if token == "clean":
+                    expected_fresh_stdout += (
+                        "Started small-01 Apply job after core capacity failure: "
+                        f"job-small-fresh-{token}"
+                        + chr(10)
+                    )
+                self.assertEqual(fresh_result.stdout, expected_fresh_stdout)
+                if token == "serious":
+                    self.assertEqual(
+                        fresh_result.stderr,
+                        "ERROR: Core Apply failed for a reason other than host capacity; retry is stopped." + chr(10),
+                    )
 
     def test_private_console_exports_route_core_then_small01(self):
         core_logs, small_log = _load_private_console_logs()
@@ -1839,7 +2144,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 creates = self.create_calls(calls)
                 self.assertEqual([call[4] for call in creates], ["stack-core"])
 
-    def test_known_unsolved_core_baseline_bypass_capacity_plus_unknown_error(self):
+    def test_core_bounded_guard_stops_capacity_plus_explicit_error(self):
         mixed_log = "\n".join(
             [
                 CAPACITY_LOG,
@@ -1861,13 +2166,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
-    def test_known_unsolved_core_baseline_bypass_unknown_error_level_after_capacity(self):
+    def test_core_bounded_guard_stops_unknown_error_level_after_capacity(self):
         mixed_log = "\n".join(
             [
                 CAPACITY_LOG,
@@ -1889,13 +2194,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
-    def test_known_unsolved_core_baseline_bypass_unknown_after_capacity_but_small_provider_stays_closed(self):
+    def test_core_bounded_guard_stops_explicit_error_but_small_provider_stays_closed(self):
         suffixes = (
             "Error: Unexpected provider failure",
             "2026/10/26 17:09:37\tERROR\tUnexpected provider failure",
@@ -1916,9 +2221,9 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         },
                     }
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
+                self.assertEqual([call[4] for call in creates], ["stack-core"])
 
         for suffix in suffixes:
             with self.subTest(block_kind="provider", suffix=suffix):
@@ -1975,7 +2280,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-core", "stack-small-01"],
         )
 
-    def test_known_unsolved_core_baseline_bypass_core_unknown_info_diagnostics(self):
+    def test_core_unknown_info_remains_unsolved_except_explicit_account_marker(self):
         for unknown_diagnostic in UNKNOWN_INFO_DIAGNOSTICS:
             with self.subTest(unknown_diagnostic=unknown_diagnostic):
                 mixed_log = "\n".join(
@@ -1999,11 +2304,16 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertEqual(result.returncode, 0, result.stderr)
+                if unknown_diagnostic == "AccountSuspended":
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    expected_creates = ["stack-core"]
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected_creates = ["stack-core", "stack-small-01"]
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
+                self.assertEqual([call[4] for call in creates], expected_creates)
 
-    def test_known_unsolved_core_baseline_bypass_unkeyed_info_after_capacity(self):
+    def test_core_unkeyed_info_remains_unsolved_except_credentials_rejected(self):
         for unknown_diagnostic in UNKEYWORDED_INFO_DIAGNOSTICS:
             with self.subTest(unknown_diagnostic=unknown_diagnostic):
                 mixed_log = "\n".join(
@@ -2027,9 +2337,14 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertEqual(result.returncode, 0, result.stderr)
+                if unknown_diagnostic == "Credentials rejected":
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    expected_creates = ["stack-core"]
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected_creates = ["stack-core", "stack-small-01"]
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
+                self.assertEqual([call[4] for call in creates], expected_creates)
 
     def test_provider_timeout_followed_by_structured_error_stops(self):
         mixed_log = "\n".join(
@@ -2096,7 +2411,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 creates = self.create_calls(calls)
                 self.assertEqual([call[4] for call in creates], ["stack-core"])
 
-    def test_known_unsolved_core_baseline_bypass_json_capacity_record(self):
+    def test_structured_json_error_capacity_record_stops(self):
         result, calls = self.run_orchestrator(
             create={
                 "stack-core": {
@@ -2112,10 +2427,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
     def test_old_non_apply_history_after_capacity_boundary_is_ignored(self):
