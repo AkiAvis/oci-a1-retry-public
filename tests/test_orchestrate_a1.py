@@ -284,6 +284,20 @@ WRONG_PROVIDER_TIMEOUT_LOG = TIMEOUT_LOG.replace(
     "hashicorp/terraform-provider-aws",
 )
 STRUCTURED_ERROR_RECORD = '{"level":"ERROR","message":"Unexpected provider failure"}'
+MULTILINE_STRUCTURED_ERROR_RECORDS = (
+    (
+        "level-error",
+        '{\n  "level": "ERROR",\n  "message": "NotAuthorizedOrNotFound"\n}',
+    ),
+    (
+        "message-error",
+        '{\n  "message": "Error: InvalidParameter"\n}',
+    ),
+    (
+        "nested-level-error",
+        '{\n  "error": {\n    "level": "ERROR",\n    "message": "NotAuthorizedOrNotFound"\n  }\n}',
+    ),
+)
 JSON_RECORD_LOG = "\n".join(
     [
         '{"level":"INFO","message":"Initializing provider plugins..."}',
@@ -328,6 +342,13 @@ def _pre_error_marker_rows(timestamp: str) -> tuple[str, ...]:
         row.format(timestamp=timestamp) if "{timestamp}" in row else row
         for row in STRUCTURALLY_UNKNOWN_PRE_ERROR_ROWS
     )
+
+
+def _bracket_info_json_record(timestamp: str, body: str, *, wrap_each_line: bool) -> str:
+    lines = body.splitlines()
+    if wrap_each_line:
+        return "\n".join(_bracket_row(timestamp, "INFO", line) for line in lines)
+    return "\n".join([_bracket_row(timestamp, "INFO", lines[0]), *lines[1:]])
 
 
 def _redact_private_log(text: str) -> str:
@@ -2432,6 +2453,129 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             [call[4] for call in self.create_calls(calls)],
             ["stack-core"],
         )
+
+    def test_multiline_structured_errors_stop_real_core_history_and_fresh_paths(self):
+        core_log, _ = _load_private_downloaded_logs()
+        records = list(MULTILINE_STRUCTURED_ERROR_RECORDS) + [
+            (
+                "bracket-info-first-line",
+                _bracket_info_json_record(
+                    "2026/10/28 04:09:38",
+                    MULTILINE_STRUCTURED_ERROR_RECORDS[0][1],
+                    wrap_each_line=False,
+                ),
+            ),
+            (
+                "bracket-info-each-line",
+                _bracket_info_json_record(
+                    "2026/10/28 04:09:38",
+                    MULTILINE_STRUCTURED_ERROR_RECORDS[1][1],
+                    wrap_each_line=True,
+                ),
+            ),
+        ]
+
+        for label, record in records:
+            for position in ("before", "after"):
+                with self.subTest(label=label, position=position):
+                    mixed_log = (
+                        record + "\n" + core_log
+                        if position == "before"
+                        else core_log + "\n" + record
+                    )
+
+                    historical_result, historical_calls = self.run_orchestrator(
+                        jobs={
+                            "stack-core": [
+                                _job("job-core-history-multiline", logs=mixed_log)
+                            ]
+                        },
+                        create={
+                            "stack-core": {
+                                "id": "job-core-history-must-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                            "stack-small-01": {
+                                "id": "job-small-history-must-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        },
+                    )
+                    self.assertNotEqual(historical_result.returncode, 0)
+                    self.assertFalse(self.create_calls(historical_calls))
+
+                    fresh_result, fresh_calls = self.run_orchestrator(
+                        create={
+                            "stack-core": {
+                                "id": "job-core-fresh-multiline",
+                                "state": "FAILED",
+                                "logs": mixed_log,
+                            },
+                            "stack-small-01": {
+                                "id": "job-small-fresh-must-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        }
+                    )
+                    self.assertNotEqual(fresh_result.returncode, 0)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(fresh_calls)],
+                        ["stack-core"],
+                    )
+
+    def test_core_guard_ignores_terraform_literal_error_values_and_resource_braces(self):
+        core_log, _ = _load_private_downloaded_logs()
+        benign_plan_rows = "\n".join(
+            [
+                _bracket_row(
+                    "2026/10/28 04:09:38",
+                    "INFO",
+                    '  + resource "oci_core_instance" "generated" {',
+                ),
+                _bracket_row(
+                    "2026/10/28 04:09:38",
+                    "INFO",
+                    '      + message = "Error: InvalidParameter"',
+                ),
+                _bracket_row(
+                    "2026/10/28 04:09:38",
+                    "INFO",
+                    '      + status = "ERROR"',
+                ),
+                _bracket_row("2026/10/28 04:09:38", "INFO", "    }"),
+            ]
+        )
+        mixed_log = _insert_before_first_message(
+            core_log,
+            "Error: 500-InternalError",
+            benign_plan_rows,
+        )
+
+        for label, script_text in (("candidate", None), ("baseline", _baseline_script_text())):
+            with self.subTest(label=label):
+                result, calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {
+                            "id": "job-core-benign-plan",
+                            "state": "FAILED",
+                            "logs": mixed_log,
+                        },
+                        "stack-small-01": {
+                            "id": "job-small-benign-plan",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    },
+                    script_text=script_text,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-core", "stack-small-01"],
+                )
 
     def test_old_non_apply_history_after_capacity_boundary_is_ignored(self):
         result, calls = self.run_orchestrator(

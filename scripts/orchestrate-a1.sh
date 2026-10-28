@@ -104,6 +104,16 @@ core_mixed_serious_error_present() {
     BEGIN {
       pending_level = ""
       serious = 0
+      json_active = 0
+      json_depth = 0
+      json_in_string = 0
+      json_escape = 0
+      json_level_error = 0
+      json_message_error = 0
+      json_invalid = 0
+      json_pending_key = ""
+      json_bracket_prefix = "^\\[[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\][[:space:]]+(INFO|WARN|ERROR)[[:space:]]-[[:space:]]*"
+      json_timestamp_prefix = "^[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9][[:space:]]+(INFO|WARN|ERROR)[[:space:]]*"
     }
 
     function trim(value) {
@@ -117,6 +127,99 @@ core_mixed_serious_error_present() {
       gsub(/[[:space:]]+/, " ", value)
       sub(/[.][[:space:]]*$/, "", value)
       return value
+    }
+
+    function reset_json_record() {
+      json_active = 0
+      json_depth = 0
+      json_in_string = 0
+      json_escape = 0
+      json_level_error = 0
+      json_message_error = 0
+      json_invalid = 0
+      json_pending_key = ""
+    }
+
+    function json_line_has_level_error(value, lower_value) {
+      lower_value = tolower(value)
+      return lower_value ~ /(^|[[:space:]{,])"level"[[:space:]]*:[[:space:]]*"error"[[:space:]]*([,}]|$)/
+    }
+
+    function json_line_has_message_error(value, lower_value) {
+      lower_value = tolower(value)
+      return lower_value ~ /(^|[[:space:]{,])"message"[[:space:]]*:[[:space:]]*"[[:space:]]*error:[^"]*"/
+    }
+
+    function json_value_line_is_error(key, value, lower_value) {
+      lower_value = tolower(trim(value))
+      if (key == "level") {
+        return lower_value ~ /^"error"[[:space:]]*[,}]?[[:space:]]*$/
+      }
+      if (key == "message") {
+        return lower_value ~ /^"[[:space:]]*error:[^"]*"[[:space:]]*[,}]?[[:space:]]*$/
+      }
+      return 0
+    }
+
+    function scan_json_record(value, trimmed, i, character, closed_on_line) {
+      if (!json_active) {
+        trimmed = value
+        sub(/^[[:space:]]+/, "", trimmed)
+        if (trimmed !~ /^\{/) return
+        json_active = 1
+        json_depth = 0
+        json_in_string = 0
+        json_escape = 0
+        json_level_error = 0
+        json_message_error = 0
+        json_invalid = 0
+        json_pending_key = ""
+      }
+
+      if (json_pending_key != "") {
+        if (json_value_line_is_error(json_pending_key, value)) {
+          if (json_pending_key == "level") json_level_error = 1
+          if (json_pending_key == "message") json_message_error = 1
+        }
+        json_pending_key = ""
+      }
+      if (json_line_has_level_error(value)) json_level_error = 1
+      if (json_line_has_message_error(value)) json_message_error = 1
+      if (tolower(value) ~ /(^|[[:space:]{,])"level"[[:space:]]*:[[:space:]]*$/) {
+        json_pending_key = "level"
+      } else if (tolower(value) ~ /(^|[[:space:]{,])"message"[[:space:]]*:[[:space:]]*$/) {
+        json_pending_key = "message"
+      }
+
+      closed_on_line = 0
+      for (i = 1; i <= length(value); i++) {
+        character = substr(value, i, 1)
+        if (json_in_string) {
+          if (json_escape) {
+            json_escape = 0
+          } else if (character == "\\") {
+            json_escape = 1
+          } else if (character == "\"") {
+            json_in_string = 0
+          }
+        } else if (character == "\"") {
+          json_in_string = 1
+        } else if (character == "{") {
+          json_depth++
+          closed_on_line = 0
+        } else if (character == "}") {
+          json_depth--
+          if (json_depth < 0) json_invalid = 1
+          if (json_depth == 0) closed_on_line = 1
+        } else if (closed_on_line && character !~ /[[:space:]]/) {
+          json_invalid = 1
+        }
+      }
+
+      if (json_depth == 0 && !json_in_string) {
+        if (!json_invalid && (json_level_error || json_message_error)) serious = 1
+        reset_json_record()
+      }
     }
 
     function is_capacity_error(message) {
@@ -155,16 +258,13 @@ core_mixed_serious_error_present() {
       raw = $0
       sub(/\r$/, "", raw)
 
-      # Structured records are not part of the supported text renderings.
-      # An explicit structured ERROR must not be hidden by a capacity marker.
-      if (raw ~ /^[[:space:]]*\{/) {
-        if (tolower(raw) ~ /"level"[[:space:]]*:[[:space:]]*"error"/ ||
-            tolower(raw) ~ /"message"[[:space:]]*:[[:space:]]*"[[:space:]]*error:/) {
-          serious = 1
-        }
-        pending_level = ""
-        next
+      json_line = raw
+      if (json_line ~ json_bracket_prefix) {
+        sub(json_bracket_prefix, "", json_line)
+      } else if (json_line ~ json_timestamp_prefix) {
+        sub(json_timestamp_prefix, "", json_line)
       }
+      scan_json_record(json_line)
 
       bracket_prefix = "^\\[[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\][[:space:]]+"
       bracket_record_prefix = bracket_prefix "(INFO|WARN|ERROR)[[:space:]]-[[:space:]]"
