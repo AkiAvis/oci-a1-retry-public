@@ -5,15 +5,16 @@ OCI Resource Manager の A1 Apply を、確認できた失敗分類に限定し�
 ## 修正した安全境界
 
 - `has_active_job` は `data` が配列で、各要素に非空の job ID と lifecycle state があることを検証します。不正な `data` を空一覧として扱いません。
-- 容量不足と provider timeout は error record/block 単位で判定します。容量不足は exact な `Out of host capacity` marker または認識済み block と、実際の Terraform 初期化・plan・resource 作成試行の INFO 継続だけを許可し、追加の未知 `Error:`、OCI `ERROR` level、provider 断片、タイムアウト、権限・認証・quota・429 の混在は停止します。最初の failure block より前は、失敗語の denylist ではなく、認識済みの provider/Terraform phase record と resource plan の構文だけを許可します。意味のない未知 INFO/WARN record と bare standalone 行は、`Service has been deactivated`、`A condition has changed`、opaque な INFO 行を含めて fail closed です。
-- `provider_checksum_download_timeout` は `small-01` / `small-02` の初期化時だけ許可します。Oracle provider の公式 GitHub checksum URLと、次の3署名を同じ provider-error block 内で順序どおり必須にします。Console の timestamp/INFO/ERROR 行・空行と、CLI の行折返しを認識し、繰り返された timeout block は個別に検証します。block 外の free-standing な timeout 文字列は根拠にしません。
+- `small-01` / `small-02` の `provider_checksum_download_timeout` だけは狭い bounded recovery classifier で判定します。Oracle provider の公式 GitHub checksum URLと、次の3署名を同じ provider-error block 内で順序どおり必須にします。Console の timestamp/INFO/ERROR 行・空行と、CLI の行折返しを認識し、繰り返された timeout block は個別に検証します。block 外の free-standing な timeout 文字列は根拠にしません。
   - `Failed to install provider`
   - `failed to retrieve authentication` → `checksums for provider`
   - `context deadline exceeded (Client.Timeout exceeded while awaiting headers)`
-- 別 provider、別 origin、plan/apply・mutation 後、容量不足や別の異常との混在、追加の未知 Error/ERROR record、署名不足は停止します。core の同じ timeout は小さい側の再試行分類に入りません。
-- history は `TIMECREATED DESC` の必要な範囲だけを厳格に検査します。最新から連続する timeout を OCI の既存履歴で数え、3件目で停止します。途中で正常な容量不足履歴に到達したらそこで境界を切り、境界より古い PLAN などは検査しません。未知 lifecycle、非 APPLY、取消、履歴/state/log の取得不良は fail closed です。未知の state は診断出力では `UNKNOWN` にクランプします。
+- small の別 provider、別 origin、plan/apply・mutation 後、容量不足や別の異常との混在、追加の未知 Error/ERROR/INFO record、署名不足、standalone/mixed unknown error は停止します。core の同じ timeout は小さい側の再試行分類に入りません。
+- **KNOWN UNSOLVED — core の既存 baseline 挙動を維持:** core の既存 failed history と freshly failed core job の容量判定は、baseline と同じ `Out of host capacity` marker match を使います。そのため、core のログに別の unknown error、provider 断片、timeout、権限・認証・quota・429、未知 INFO/WARN、構造化/不正形式の行が併記されても、容量 marker があれば core → small-01 fallback に進む可能性があります。これは pre-existing mixed-error safety limitation の記録であり、修正でも保証でもありません。`test_known_unsolved_core_baseline_bypass_*` で明示的にカバーし、core の全 unknown error が fail closed とは主張しません。
+- core にも `history` の配列・entry・APPLY・state 一致、log 読み取り、active-job、inventory、重複、未知 target、429 defer などの独立した共有ガードは残します。従って baseline の容量 marker 挙動を保つことは、orchestrator 全体の挙動が baseline と同一という意味ではありません。
+- history は `TIMECREATED DESC` の必要な範囲だけを厳格に検査します。small の最新から連続する timeout を OCI の既存履歴で数え、3件目で停止します。small の途中で正常な容量不足履歴に到達したらそこで境界を切り、境界より古い PLAN などは検査しません。未知 lifecycle、非 APPLY、取消、履歴/state/log の取得不良は fail closed です。未知の state は診断出力では `UNKNOWN` にクランプします。
 - target label、state、safe job identifier だけを診断に出し、CLI の生エラーやログ本文は出しません。既存の inventory、active-job、重複、未知インスタンス、成功済みだが対象不在、429 defer の安全基準は維持します。
-- 認識済み resource syntax の中にある Terraform payload は、timestamp wrapper の有無にかかわらず、属性・nested block・closing brace の構文だけを継続として扱います。属性値や resource 名が変わっても継続できますが、その内容が意味的に正常かを universal に判定するものではありません。認識済み syntax の外にある standalone record は fail closed です。実 OCI CLI のログ形式と、本番での動作も未確認です。
+- 認識済み resource syntax の中にある Terraform payload は、timestamp wrapper の有無にかかわらず、属性・nested block・closing brace の構文だけを small の分類継続として扱います。属性値や resource 名が変わっても継続できますが、その内容が意味的に正常かを universal に判定するものではありません。実 OCI CLI のログ形式と、本番での動作も未確認です。
 
 ## オフライン TDD 検証
 
@@ -28,8 +29,9 @@ OCI Resource Manager の A1 Apply を、確認できた失敗分類に限定し�
 - 容量不足境界より古い PLAN を全履歴検証して停止する。
 - `data` が配列でない job list を空一覧として通過する。
 - checksum timeout の別 origin / 別 provider を許可する。
-- さらに、容量不足と provider エラー断片の混在、provider timeout と `InvalidParameter` / `AccountSuspended` の追加 Error、容量不足後の未知 OCI `ERROR` level も RED で確認しました。
-- `Service has been deactivated`、`A condition has changed`、opaque な INFO row、bare standalone contamination を、core raw log と small Console log の failure 前の複数位置で受け入れないことを RED で確認しました。正常な provider 再初期化、Terraform plan/resource payload、core → small-01 の target sequence は維持します。
+- 実際の downloaded core + small-01 full logs に、仮想の harmless な新規 `WARN` prelude record を core failure の前に挿入すると、現 candidate は fake core 後に停止して small-01 に進まない。修正後は core → small-01 になり、同じ core path を baseline script でも replay しました。baseline の small provider-timeout 判定は既知の別問題を避けるため clean capacity small history に分離しています。
+- core の容量 marker と別の provider/error/timeout/INFO/WARN を混在させた synthetic logs は、baseline-compatible な **KNOWN UNSOLVED** bypass として保持しています。これらは fail-closed の証拠ではありません。small の provider timeout と `InvalidParameter` / `AccountSuspended` / structured unknown の混在は従来どおり stop します。
+- `Service has been deactivated`、`A condition has changed`、opaque な INFO row、bare standalone contamination を small Console log の failure 前の複数位置で受け入れないことを RED で確認しました。core 側の同じ synthetic rows は baseline limitation の明示的テストです。正常な provider 再初期化、Terraform plan/resource payload、core → small-01 の target sequence は維持します。
 - unknown lifecycle を active-job なしとして通過させず、未知 state を診断に漏らす。
 
 修正後は上記の focused tests を GREEN にし、受入れ時は private `OCI_A1_RETRY_LOG_DIR` を指定して supplied downloaded log と Console export を秘密値をメモリ内で redacted して replay します。downloaded log/Console export の内容は fixture としてリポジトリに追加していません。private log replay を省略した実行は受入れ証拠にしません。テスト件数は固定値として README に記録せず、実行時の `unittest` 出力で確認します。
@@ -41,6 +43,14 @@ env -i HOME="$HOME" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" PYTHONDONTWRITEBYTECODE=
 
 git diff --check
 ```
+
+## Candidate status and unresolved gates
+
+この作業は offline candidate の TDD だけです。workflow dispatch、OCI Apply、Cloudflare/GitHub/Oracle への接続、quota/grant/key の追加、15分 scheduler の変更、deploy は行いません。テストの GREEN は無請求・無事故・無プライバシー/セキュリティ影響・Oracle 側問題なしを保証しません。
+
+- core の capacity + unknown mixed-error bypass は **KNOWN UNSOLVED** のままです。これは baseline 互換のために意図的に残した意味上の例外で、release safety の解決ではありません。
+- private downloaded/Console logs の offline replay は実 OCI CLI の live stdout、provider inventory、account-wide free-tier/billing 状態、次回 scheduler の実行結果を証明しません。
+- これらの未解決 gate が満たされない限り、この candidate を production に deploy/activate しません。
 
 ## 変更範囲
 

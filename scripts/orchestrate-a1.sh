@@ -595,6 +595,20 @@ provider_timeout_history_allows() {
   return 0
 }
 
+# Core intentionally retains baseline marker-only capacity recognition. Mixed
+# core errors remain a documented known-unsolved safety limitation; small paths
+# continue through the strict provider-timeout classifier.
+core_capacity_history_allows() {
+  local label="$1" expected_state="$2" latest="$3" logs
+
+  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$latest" --output json --query data --raw-output 2>&1)" || stop_for_failure "$label" "$expected_state" "$latest" log_unavailable
+  if grep -Fqi 'Out of host capacity' <<<"$logs"; then
+    echo "Observed $label Apply history: diagnostic=capacity state=$expected_state job=$(safe_job_id "$latest")." >&2
+    return 0
+  fi
+  stop_for_failure "$label" "$expected_state" "$latest" unknown
+}
+
 ensure_retry_allowed() {
   local stack_id="$1" label="$2" history latest state history_state latest_entry history_count
   if ! history="$(ordered_job_history "$stack_id")"; then
@@ -617,7 +631,11 @@ ensure_retry_allowed() {
 
   case "$state" in
     FAILED)
-      provider_timeout_history_allows "$label" "$history" "$state" "$latest"
+      if [[ "$label" == "core 2/12" ]]; then
+        core_capacity_history_allows "$label" "$state" "$latest"
+      else
+        provider_timeout_history_allows "$label" "$history" "$state" "$latest"
+      fi
       ;;
     SUCCEEDED)
       stop_for_failure "$label" "$state" "$latest" succeeded
@@ -710,10 +728,9 @@ wait_for_terminal() {
 }
 
 failure_is_capacity() {
-  local job_id="$1" logs classification
+  local job_id="$1" logs
   logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" --output json --query data --raw-output 2>&1)" || fail "Could not read failed-job logs."
-  classification="$(failure_classification "$logs")" || return 1
-  [[ "$classification" == capacity ]]
+  grep -Fqi 'Out of host capacity' <<<"$logs"
 }
 
 for stack_id in "$OCI_CORE_STACK_ID" "$OCI_SMALL_01_STACK_ID" "$OCI_SMALL_02_STACK_ID"; do

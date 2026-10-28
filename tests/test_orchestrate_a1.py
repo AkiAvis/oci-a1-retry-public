@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "orchestrate-a1.sh"
+BASELINE_COMMIT = "0b0dd9b049ac30761d04b0d6326e0bbccc1601b4"
 SCRATCH = Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
 
 TIMEOUT_LOG = "\n".join(
@@ -377,6 +378,19 @@ def _load_private_console_logs() -> tuple[tuple[str, ...], str]:
     return core_logs, small_log
 
 
+def _baseline_script_text() -> str:
+    result = subprocess.run(
+        ["git", "show", f"{BASELINE_COMMIT}:scripts/orchestrate-a1.sh"],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError("could not read the baseline orchestrator")
+    return result.stdout
+
+
 def _make_executable(path: Path, content: str) -> None:
     path.write_text(content)
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
@@ -414,6 +428,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         state_failures=None,
         state_overrides=None,
         extra_env=None,
+        script_text=None,
     ):
         jobs = jobs or {}
         inventory = inventory if inventory is not None else {"data": []}
@@ -428,6 +443,10 @@ class OrchestrateA1TestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp_dir:
             temp = Path(temp_dir)
+            script_path = SCRIPT
+            if script_text is not None:
+                script_path = temp / "orchestrate-a1-baseline.sh"
+                _make_executable(script_path, script_text)
             config_path = temp / "fake-cli-config.json"
             calls_path = temp / "fake-cli-calls.jsonl"
             config_path.write_text(
@@ -571,7 +590,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
                 env.update(extra_env)
 
             result = subprocess.run(
-                ["/usr/bin/bash", str(SCRIPT)],
+                ["/usr/bin/bash", str(script_path)],
                 cwd=REPO,
                 env=env,
                 text=True,
@@ -748,7 +767,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("provider_timeout_budget_exhausted", result.stderr)
         self.assertFalse(self.create_calls(calls))
-    def test_mixed_capacity_and_provider_timeout_does_not_fallback_to_small01(self):
+    def test_known_unsolved_core_baseline_bypass_mixed_capacity_and_provider_timeout(self):
         mixed_log = "\n".join(["Out of host capacity", TIMEOUT_LOG])
         result, calls = self.run_orchestrator(
             create={
@@ -765,11 +784,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
 
-    def test_partial_provider_error_with_capacity_is_ambiguous(self):
+    def test_known_unsolved_core_baseline_bypass_partial_provider_error_with_capacity(self):
         result, calls = self.run_orchestrator(
             create={
                 "stack-core": {
@@ -785,10 +806,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
-    def test_capacity_and_generic_timeout_is_ambiguous(self):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
+
+    def test_known_unsolved_core_baseline_bypass_capacity_and_generic_timeout(self):
         result, calls = self.run_orchestrator(
             create={
                 "stack-core": {
@@ -804,9 +828,11 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
 
     def test_capacity_failure_still_allows_retry(self):
         result, calls = self.run_orchestrator(
@@ -817,7 +843,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertEqual(len(self.create_calls(calls)), 1)
         self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
 
-    def test_explicit_prelude_failures_stop_before_fallback(self):
+    def test_known_unsolved_core_baseline_bypass_explicit_prelude_failures(self):
         preludes = (
             "2026/10/26 17:09:35\tINFO\tCredentials rejected",
             "2026/10/26 17:09:35\tINFO\tAccount is disabled",
@@ -839,14 +865,20 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         "stack-small-01": {"id": "job-small-new", "state": "SUCCEEDED", "logs": ""},
                     }
                 )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual([call[4] for call in self.create_calls(calls)], ["stack-core"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-core", "stack-small-01"],
+                )
 
                 historical, historical_calls = self.run_orchestrator(
                     jobs={"stack-core": [_job("job-old-mixed", logs=mixed_log)]},
                 )
-                self.assertNotEqual(historical.returncode, 0)
-                self.assertEqual(self.create_calls(historical_calls), [])
+                self.assertEqual(historical.returncode, 0, historical.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(historical_calls)],
+                    ["stack-core"],
+                )
 
     def test_realistic_capacity_log_allows_core_retry_and_small01_fallback(self):
         result, calls = self.run_orchestrator(
@@ -917,7 +949,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-small-02"],
         )
 
-    def test_bracket_credentials_and_account_markers_fail_closed_before_and_after_known_blocks(self):
+    def test_known_unsolved_core_baseline_bypass_but_small_provider_markers_still_fail_closed(self):
         markers = (
             _bracket_row("2026/10/28 10:00:04", "INFO", "Credentials rejected"),
             _bracket_row("2026/10/28 10:00:04", "ERROR", "AccountSuspended"),
@@ -975,13 +1007,20 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                                 },
                             )
 
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertEqual(
-                            [call[4] for call in self.create_calls(calls)],
-                            ["stack-core"],
-                        )
+                        if block_name == "capacity":
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(
+                                [call[4] for call in self.create_calls(calls)],
+                                ["stack-core", "stack-small-01"],
+                            )
+                        else:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertEqual(
+                                [call[4] for call in self.create_calls(calls)],
+                                ["stack-core"],
+                            )
 
-    def test_bracket_unknown_error_or_info_after_known_block_stops(self):
+    def test_known_unsolved_core_baseline_bypass_bracket_unknown_after_capacity_block(self):
         suffixes = (
             "Error: Unexpected provider failure",
             _bracket_row("2026/10/28 10:00:04", "ERROR", "Unexpected provider failure"),
@@ -1004,13 +1043,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     [call[4] for call in self.create_calls(calls)],
-                    ["stack-core"],
+                    ["stack-core", "stack-small-01"],
                 )
 
-    def test_bracket_unknown_level_or_missing_delimiter_stops(self):
+    def test_known_unsolved_core_baseline_bypass_bracket_malformed_capacity_marker(self):
         malformed_rows = (
             _bracket_row(
                 "2026/10/28 10:00:04",
@@ -1036,10 +1075,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     [call[4] for call in self.create_calls(calls)],
-                    ["stack-core"],
+                    ["stack-core", "stack-small-01"],
                 )
 
     def test_known_terraform_capacity_diagnostics_remain_accepted(self):
@@ -1089,7 +1128,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-core", "stack-small-01"],
         )
 
-    def test_private_downloaded_full_logs_and_pre_error_markers_fail_closed(self):
+    def test_known_unsolved_core_baseline_bypass_private_core_markers_small_markers_still_stop(self):
         core_log, small_log = _load_private_downloaded_logs()
 
         normal_result, normal_calls = self.run_orchestrator(
@@ -1169,11 +1208,18 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         },
                     )
 
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(
-                    [call[4] for call in self.create_calls(calls)],
-                    ["stack-core"],
-                )
+                if block_name == "core":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core", "stack-small-01"],
+                    )
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core"],
+                    )
 
         result, calls = self.run_orchestrator(
             create={
@@ -1190,10 +1236,71 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 },
             }
         )
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core"],
+            ["stack-core", "stack-small-01"],
+        )
+
+    def test_actual_full_logs_benign_core_warn_preserves_core_then_small_and_replays_baseline_core_path(self):
+        core_log, small_log = _load_private_downloaded_logs()
+        warned_core_log = _insert_before_first_message(
+            core_log,
+            "Error: 500-InternalError",
+            "2026/10/28 04:09:38\tWARN\tHarmless provider prelude notice",
+        )
+
+        candidate_result, candidate_calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-private-core-old-capacity", logs=core_log)],
+                "stack-small-01": [_job("job-private-small-old-timeout", logs=small_log)],
+            },
+            create={
+                "stack-core": {
+                    "id": "job-private-core-new-warn",
+                    "state": "FAILED",
+                    "logs": warned_core_log,
+                },
+                "stack-small-01": {
+                    "id": "job-private-small-new-warn",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            },
+        )
+
+        self.assertEqual(candidate_result.returncode, 0, candidate_result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(candidate_calls)],
+            ["stack-core", "stack-small-01"],
+        )
+
+        baseline_result, baseline_calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-baseline-core-old-capacity", logs=core_log)],
+                "stack-small-01": [
+                    _job("job-baseline-small-capacity", logs="Out of host capacity")
+                ],
+            },
+            create={
+                "stack-core": {
+                    "id": "job-baseline-core-new-warn",
+                    "state": "FAILED",
+                    "logs": warned_core_log,
+                },
+                "stack-small-01": {
+                    "id": "job-baseline-small-new-warn",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            },
+            script_text=_baseline_script_text(),
+        )
+
+        self.assertEqual(baseline_result.returncode, 0, baseline_result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(baseline_calls)],
+            ["stack-core", "stack-small-01"],
         )
 
     def test_private_console_exports_route_core_then_small01(self):
@@ -1225,7 +1332,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     ["stack-core", "stack-small-01"],
                 )
 
-    def test_unknown_record_inside_timestamped_core_resource_payload_stops(self):
+    def test_known_unsolved_core_baseline_bypass_unknown_record_inside_core_payload(self):
         core_log, _ = _load_private_downloaded_logs()
         lines = core_log.splitlines()
         resource_index = next(
@@ -1256,10 +1363,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core"],
+            ["stack-core", "stack-small-01"],
         )
 
     def test_variable_plan_prelude_routes_core_then_small01(self):
@@ -1293,7 +1400,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-core", "stack-small-01"],
         )
 
-    def test_structurally_unknown_core_pre_error_records_stop_before_small01_fallback(self):
+    def test_known_unsolved_core_baseline_bypass_structurally_unknown_core_prelude_records(self):
         positions = (
             ("start", 0),
             ("provider-and-plan-prelude", 6),
@@ -1324,10 +1431,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                             },
                         }
                     )
-                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(
                         [call[4] for call in self.create_calls(calls)],
-                        ["stack-core"],
+                        ["stack-core", "stack-small-01"],
                     )
 
     def test_structurally_unknown_small_console_pre_error_records_stop_before_small01_retry(self):
@@ -1448,7 +1555,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 creates = self.create_calls(calls)
                 self.assertEqual([call[4] for call in creates], ["stack-core"])
 
-    def test_capacity_plus_unknown_error_stops_without_small01_fallback(self):
+    def test_known_unsolved_core_baseline_bypass_capacity_plus_unknown_error(self):
         mixed_log = "\n".join(
             [
                 CAPACITY_LOG,
@@ -1470,11 +1577,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
 
-    def test_unknown_error_level_after_capacity_stops(self):
+    def test_known_unsolved_core_baseline_bypass_unknown_error_level_after_capacity(self):
         mixed_log = "\n".join(
             [
                 CAPACITY_LOG,
@@ -1496,11 +1605,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
 
-    def test_unknown_error_text_or_level_after_any_accepted_block_stops(self):
+    def test_known_unsolved_core_baseline_bypass_unknown_after_capacity_but_small_provider_stays_closed(self):
         suffixes = (
             "Error: Unexpected provider failure",
             "2026/10/26 17:09:37\tERROR\tUnexpected provider failure",
@@ -1521,9 +1632,9 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         },
                     }
                 )
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], ["stack-core"])
+                self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
 
         for suffix in suffixes:
             with self.subTest(block_kind="provider", suffix=suffix):
@@ -1552,7 +1663,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 creates = self.create_calls(calls)
                 self.assertEqual([call[4] for call in creates], ["stack-core"])
 
-    def test_info_unexpected_provider_failure_after_capacity_stops(self):
+    def test_known_unsolved_core_baseline_bypass_info_unexpected_provider_failure_after_capacity(self):
         mixed_log = "\n".join(
             [
                 CAPACITY_LOG,
@@ -1574,11 +1685,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
 
-    def test_core_unknown_info_diagnostics_stop_before_small01_fallback(self):
+    def test_known_unsolved_core_baseline_bypass_core_unknown_info_diagnostics(self):
         for unknown_diagnostic in UNKNOWN_INFO_DIAGNOSTICS:
             with self.subTest(unknown_diagnostic=unknown_diagnostic):
                 mixed_log = "\n".join(
@@ -1602,11 +1715,11 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], ["stack-core"])
+                self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
 
-    def test_unkeyed_info_after_capacity_stops_before_small01_fallback(self):
+    def test_known_unsolved_core_baseline_bypass_unkeyed_info_after_capacity(self):
         for unknown_diagnostic in UNKEYWORDED_INFO_DIAGNOSTICS:
             with self.subTest(unknown_diagnostic=unknown_diagnostic):
                 mixed_log = "\n".join(
@@ -1630,9 +1743,9 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], ["stack-core"])
+                self.assertEqual([call[4] for call in creates], ["stack-core", "stack-small-01"])
 
     def test_provider_timeout_followed_by_structured_error_stops(self):
         mixed_log = "\n".join(
@@ -1699,7 +1812,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 creates = self.create_calls(calls)
                 self.assertEqual([call[4] for call in creates], ["stack-core"])
 
-    def test_json_log_records_are_rejected_as_non_raw_text(self):
+    def test_known_unsolved_core_baseline_bypass_json_capacity_record(self):
         result, calls = self.run_orchestrator(
             create={
                 "stack-core": {
@@ -1715,9 +1828,11 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(self.create_calls(calls)), 1)
-        self.assertEqual(self.create_calls(calls)[0][4], "stack-core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core", "stack-small-01"],
+        )
 
     def test_old_non_apply_history_after_capacity_boundary_is_ignored(self):
         result, calls = self.run_orchestrator(
