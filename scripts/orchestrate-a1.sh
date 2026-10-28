@@ -105,6 +105,7 @@ classify_failure_records() {
       seen_blocks = 0
       post_provider = 0
       saw_nonempty_prelude = 0
+      payload_depth = 0
     }
 
     function trim(value) {
@@ -133,6 +134,47 @@ classify_failure_records() {
       return 0
     }
 
+    function known_terraform_prelude(message) {
+      if (message ~ /^-[[:space:]]*(Finding latest version of|Installing|Installed|Reusing previous version|Using previously-installed)[[:space:]]+[^[:space:]]+/ ||
+          message ~ /^-[[:space:]]+[A-Za-z0-9_.-]+[/][A-Za-z0-9_.-]+$/) {
+        return 1
+      }
+      if (message ~ /^Terraform has created a lock file[[:space:]]+[^[:space:]]+[[:space:]]+to record the provider$/ ||
+          message == "selections it made above. Include this file in your version control repository" ||
+          message == "so that Terraform can guarantee to make the same selections by default when" ||
+          message ~ /^you run "[^"]+" in the future[.]$/ ||
+          message == "Warning: Incomplete lock file information for providers" ||
+          message == "Due to your customized provider installation methods, Terraform was forced to" ||
+          message == "calculate lock file checksums locally for the following providers:" ||
+          message ~ /^The current[[:space:]]+\.terraform\.lock\.hcl file only includes checksums for[[:space:]]+[A-Za-z0-9_.-]+,$/ ||
+          message == "so Terraform running on another platform will fail to install these" ||
+          message == "providers." ||
+          message == "To calculate additional checksums for another platform, run:" ||
+          message ~ /^terraform providers lock -platform=[A-Za-z0-9_.-]+$/ ||
+          message ~ /^\(where[[:space:]]+[A-Za-z0-9_.-]+[[:space:]]+is the platform to generate\)$/) {
+        return 1
+      }
+      if (message == "Terraform used the selected providers to generate the following execution" ||
+          message == "plan. Resource actions are indicated with the following symbols:" ||
+          message == "+ create" ||
+          message == "- destroy" ||
+          message == "~ update" ||
+          message == "<= read" ||
+          message ~ /^You may now begin working with Terraform[.] Try running "[^"]+" to see$/ ||
+          message == "any changes that are required for your infrastructure. All Terraform commands" ||
+          message == "should now work." ||
+          message == "If you ever set or change modules or backend configuration for Terraform," ||
+          message == "rerun this command to reinitialize your working directory. If you forget, other" ||
+          message == "commands will detect it and remind you to do so if necessary." ||
+          message ~ /^Loading Environment variables from[[:space:]]+[A-Za-z0-9_.-]+[[:space:]]+file[.][.][.]$/) {
+        return 1
+      }
+      if (message ~ /^[A-Za-z0-9_.-]+([.][A-Za-z0-9_.-]+)*:[[:space:]]+Refreshing state[.][.][.]([[:space:]]+\[[[:space:]]*id=[^]]+\])?$/) {
+        return 1
+      }
+      return 0
+    }
+
     function known_capacity_diagnostic(message) {
       if (message ~ /^Suggestion: The service for this resource encountered an error[.]([[:space:]]+Please contact support for help with service:[[:space:]]+[A-Za-z][A-Za-z0-9 ._-]*[.]?)?$/ ||
           message ~ /^(Documentation|API Reference):[[:space:]]+https:[/][/]((registry[.]terraform[.]io)|(docs[.]oracle[.]com))[/][^[:space:]]+$/ ||
@@ -154,15 +196,83 @@ classify_failure_records() {
       return known_provider_retry_prelude(message) || message == "Error: Failed to install provider"
     }
 
-    function prelude_failure_marker(message) {
-      lower = tolower(message)
-      if (lower ~ /(^|[^[:alnum:]_])(invalidparameter|invalid[[:space:]]+parameter|account[[:space:]]+is[[:space:]]+disabled|accountsuspend[[:alpha:]]*|licensesuspend[[:alpha:]]*|serviceunavailable|notauthorized[[:alpha:]]*|suspend[[:alpha:]]*|unauthor[[:alpha:]]*|forbidden|deni[[:alpha:]]*|reject[[:alpha:]]*|revok[[:alpha:]]*|fatal|failure[[:alpha:]]*|failed|exception[[:alpha:]]*|timeout[[:alpha:]]*|timed[[:space:]]+out|unavailable|quota|limit[[:space:]]+exceed[[:alpha:]]*|too[[:space:]]+many[[:space:]]+requests|error[[:alpha:]]*)([^[:alnum:]_]|$)/) {
+    function known_console_wrapper(message) {
+      return message == "開発者サービス" ||
+             message == "スタックの詳細" ||
+             message == "失敗" ||
+             message == "ジョブ" ||
+             message == "アクション" ||
+             message == "ログ" ||
+             message == "検索" ||
+             message == "タイム・スタンプ" ||
+             message == "レベル" ||
+             message == "メッセージ" ||
+             message ~ /^ormjob[0-9]+$/
+    }
+
+    function prelude_record_is_safe(level, message) {
+      # This is a positive grammar for normal Terraform/provider output. It
+      # deliberately does not classify arbitrary INFO text by looking for
+      # more failure words.
+      if (level != "" && level != "INFO" && level != "WARN") return 0
+      if (message == "") return 1
+      if (known_console_wrapper(message) || known_provider_retry_prelude(message) || known_terraform_prelude(message)) return 1
+      if (message == "Initializing the backend..." ||
+          message == "Initializing modules..." ||
+          message == "Terraform has been successfully initialized!" ||
+          message == "Terraform used the selected providers to generate the following execution plan." ||
+          message == "Terraform will perform the following actions:" ||
+          message == "Changes to Outputs:" ||
+          message == "Resources:") {
         return 1
       }
-      if (lower ~ /(^|[^0-9])(401|403|429|500)([^0-9]|$)/) {
+      if (message ~ /^Plan:[[:space:]]*[0-9]+[[:space:]]+to add,[[:space:]]*[0-9]+[[:space:]]+to change,[[:space:]]*[0-9]+[[:space:]]+to destroy[.]$/ ||
+          message ~ /^No changes[.][[:space:]]+Your infrastructure matches the configuration[.]$/) {
+        return 1
+      }
+      if (message ~ /^[A-Za-z0-9_.-]+([.][A-Za-z0-9_.-]+)*:[[:space:]]+(Creating|Created|Modifying|Modified|Destroying|Destroyed|Refreshing state)([.][.][.]|[[:space:]])$/ ||
+          message ~ /^Refreshing state[.][.][.]$/) {
+        return 1
+      }
+      if (message ~ /^[[:space:]]*#[[:space:]]+[A-Za-z0-9_.-]+[[:space:]]+will be (created|updated|destroyed)$/ ||
+          message ~ /^[[:space:]]*[+~-][[:space:]]+resource[[:space:]]+"[^"]+"[[:space:]]+"[^"]+"[[:space:]]*\{[[:space:]]*$/) {
         return 1
       }
       return 0
+    }
+
+    function terraform_payload_record_is_safe(message) {
+      if (message == "}" ||
+          message ~ /^[+~-][[:space:]]+[A-Za-z0-9_.-]+([[:space:]]+"[^"]+")*[[:space:]]*\{[[:space:]]*$/ ||
+          message ~ /^[+~-][[:space:]]+("[^"]+"|[A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*.*$/) {
+        return 1
+      }
+      return 0
+    }
+
+    function terraform_payload_boundary(message) {
+      return message ~ /^Plan:[[:space:]]*[0-9]+[[:space:]]+to add,[[:space:]]*[0-9]+[[:space:]]+to change,[[:space:]]*[0-9]+[[:space:]]+to destroy[.]$/ ||
+             message ~ /^No changes[.][[:space:]]+Your infrastructure matches the configuration[.]$/
+    }
+
+    function terraform_brace_delta(message,   i, character, in_quote, delta) {
+      in_quote = 0
+      delta = 0
+      for (i = 1; i <= length(message); i++) {
+        character = substr(message, i, 1)
+        if (character == "\"") {
+          in_quote = !in_quote
+        } else if (!in_quote && character == "{") {
+          delta++
+        } else if (!in_quote && character == "}") {
+          delta--
+        }
+      }
+      return delta
+    }
+
+    function starts_terraform_payload(message) {
+      return message ~ /^[[:space:]]*[+~-][[:space:]]+resource[[:space:]]+"[^"]+"[[:space:]]+"[^"]+"[[:space:]]*\{[[:space:]]*$/
     }
 
     function finalize_block() {
@@ -306,6 +416,10 @@ classify_failure_records() {
       }
       message = trim(message)
 
+      # Downloaded core rows can all carry a timestamped INFO wrapper. Keep
+      # the Terraform payload state across those wrappers and validate each
+      # continuation as a resource/attribute/closing-brace record.
+
       # get-job-logs-content is consumed as raw text here. Structured records
       # and unclassified error text are ambiguous, so fail closed instead of
       # guessing a JSON or alternate envelope.
@@ -341,7 +455,21 @@ classify_failure_records() {
         next
       }
       if (seen_blocks == 0) {
-        if (prelude_failure_marker(message)) invalid = 1
+        if (payload_depth > 0 && !terraform_payload_boundary(message)) {
+          if (!terraform_payload_record_is_safe(message)) {
+            invalid = 1
+            next
+          }
+          payload_depth += terraform_brace_delta(message)
+          if (payload_depth < 0) invalid = 1
+          saw_nonempty_prelude = 1
+          next
+        }
+        if (payload_depth > 0) payload_depth = 0
+        if (!prelude_record_is_safe(level, message)) invalid = 1
+        if (starts_terraform_payload(message)) {
+          payload_depth = terraform_brace_delta(message)
+        }
         saw_nonempty_prelude = 1
         next
       }
@@ -353,6 +481,7 @@ classify_failure_records() {
 
     END {
       finalize_block()
+      if (payload_depth > 0) invalid = 1
       if (bare_capacity > 1) invalid = 1
       if (bare_capacity > 0) capacity_blocks++
       if (capacity_blocks > 1) invalid = 1

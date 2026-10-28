@@ -85,8 +85,13 @@ def _bracket_row(timestamp: str, level: str, message: str = "") -> str:
 
 BRACKET_CAPACITY_LOG = "\n".join(
     [
-        _bracket_row("2026/10/28 10:00:00", "INFO", "Synthetic provider prelude"),
-        _bracket_row("2026/10/28 10:00:01", "WARN", "Synthetic warning retained"),
+        _bracket_row(
+            "2026/10/28 10:00:00",
+            "INFO",
+            "Getting providers from registry and/or custom terraform providers",
+        ),
+        _bracket_row("2026/10/28 10:00:01", "INFO", "Initializing provider plugins..."),
+        _bracket_row("2026/10/28 10:00:01", "INFO", "- Finding latest version of oracle/oci..."),
         _bracket_row(
             "2026/10/28 10:00:02",
             "ERROR",
@@ -159,16 +164,20 @@ _CAPACITY_ERROR_TAIL = CAPACITY_LOG.split(
 )[1]
 VARIABLE_PRELUDE_CAPACITY_LOG = "\n".join(
     [
-        "Synthetic Resource Manager log export",
-        "job identifier: redacted-job",
-        "2026/10/26 17:09:27\tINFO\t",
-        "Terraform selected a provider and loaded custom variables",
-        "2026/10/26 17:09:29\tWARN\tprovider lock metadata is incomplete",
-        "  - synthetic provider detail: retained for diagnostics",
-        "2026/10/26 17:09:33\tINFO\t",
-        "  # synthetic resource will be created",
-        '      + availability_domain = "synthetic-ad-1"',
-        "      + custom_unknown_plan_field = (known after apply)",
+        "2026/10/26 17:09:27\tINFO\tGetting providers from registry and/or custom terraform providers",
+        "2026/10/26 17:09:27\tINFO\tInitializing provider plugins...",
+        "2026/10/26 17:09:27\tINFO\t-Finding latest version of oracle/oci...",
+        "2026/10/26 17:09:29\tINFO\tTerraform has been successfully initialized!",
+        "2026/10/26 17:09:33\tINFO\tTerraform used the selected providers to generate the following execution plan.",
+        "2026/10/26 17:09:33\tINFO\tTerraform will perform the following actions:",
+        "2026/10/26 17:09:33\tINFO\t  # module.synthetic.oci_core_instance.generated will be created",
+        '2026/10/26 17:09:33\tINFO\t  + resource "oci_core_instance" "generated_alt" {',
+        '      + arbitrary_plan_field = "opaque-but-embedded"',
+        '      + opaque_plan_field = "opaque-but-embedded"',
+        '      + availability_domain = "synthetic-ad-2"',
+        "    }",
+        "2026/10/26 17:09:33\tINFO\tPlan: 1 to add, 0 to change, 0 to destroy.",
+        "2026/10/26 17:09:35\tINFO\tmodule.synthetic.oci_core_instance.generated: Creating...",
         "2026/10/26 17:09:36\tERROR\t",
         _CAPACITY_ERROR_TAIL,
     ]
@@ -270,6 +279,30 @@ UNKEYWORDED_INFO_DIAGNOSTICS = (
     "Access revoked",
     "LicenseSuspended",
 )
+STRUCTURALLY_UNKNOWN_PRE_ERROR_ROWS = (
+    "{timestamp}\tINFO\tService has been deactivated",
+    "{timestamp}\tINFO\tA condition has changed",
+    "{timestamp}\tINFO\tOpaque unexpected INFO row",
+    "bare standalone contamination",
+)
+
+
+def _insert_before_first_message(log: str, needle: str, marker: str) -> str:
+    lines = log.splitlines()
+    index = next(index for index, line in enumerate(lines) if needle in line)
+    return "\n".join(lines[:index] + [marker] + lines[index:])
+
+
+def _insert_at_line(log: str, index: int, marker: str) -> str:
+    lines = log.splitlines()
+    return "\n".join(lines[:index] + [marker] + lines[index:])
+
+
+def _pre_error_marker_rows(timestamp: str) -> tuple[str, ...]:
+    return tuple(
+        row.format(timestamp=timestamp) if "{timestamp}" in row else row
+        for row in STRUCTURALLY_UNKNOWN_PRE_ERROR_ROWS
+    )
 
 
 def _redact_private_log(text: str) -> str:
@@ -317,6 +350,31 @@ def _load_private_downloaded_logs() -> tuple[str, str]:
     if len(core_candidates) != 1 or len(small_candidates) != 1:
         raise AssertionError("could not identify the two supplied downloaded logs")
     return _redact_private_log(core_candidates[0]), _redact_private_log(small_candidates[0])
+
+
+def _load_private_console_logs() -> tuple[tuple[str, ...], str]:
+    root_value = os.environ.get("OCI_A1_RETRY_LOG_DIR")
+    if not root_value:
+        raise unittest.SkipTest("set OCI_A1_RETRY_LOG_DIR for private Console-log replay")
+
+    root = Path(root_value)
+    if not root.is_dir():
+        raise AssertionError("OCI_A1_RETRY_LOG_DIR is not a directory")
+
+    core_names = ("貼り付けた内容 (15-2.3 KB)", "貼り付けた内容 (15-3.3 KB)")
+    small_name = "貼り付けた内容 (3-2.7 KB)"
+    paths = [root / name for name in (*core_names, small_name)]
+    if not all(path.is_file() for path in paths):
+        raise AssertionError("could not identify the supplied Console exports")
+
+    core_logs = tuple(
+        _redact_private_log(path.read_text(encoding="utf-8", errors="replace"))
+        for path in paths[:2]
+    )
+    small_log = _redact_private_log(
+        paths[2].read_text(encoding="utf-8", errors="replace")
+    )
+    return core_logs, small_log
 
 
 def _make_executable(path: Path, content: str) -> None:
@@ -1138,6 +1196,72 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-core"],
         )
 
+    def test_private_console_exports_route_core_then_small01(self):
+        core_logs, small_log = _load_private_console_logs()
+        for index, core_log in enumerate(core_logs):
+            with self.subTest(core_export=index):
+                result, calls = self.run_orchestrator(
+                    jobs={
+                        "stack-core": [_job("job-private-console-core-old", logs=core_log)],
+                        "stack-small-01": [_job("job-private-console-small-old", logs=small_log)],
+                    },
+                    create={
+                        "stack-core": {
+                            "id": "job-private-console-core-new",
+                            "state": "FAILED",
+                            "logs": core_log,
+                        },
+                        "stack-small-01": {
+                            "id": "job-private-console-small-new",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    },
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-core", "stack-small-01"],
+                )
+
+    def test_unknown_record_inside_timestamped_core_resource_payload_stops(self):
+        core_log, _ = _load_private_downloaded_logs()
+        lines = core_log.splitlines()
+        resource_index = next(
+            index
+            for index, line in enumerate(lines)
+            if "+ resource " in line
+        )
+        marker = _bracket_row(
+            "2026/10/28 04:09:38",
+            "INFO",
+            "Opaque unexpected INFO row",
+        )
+        mixed_log = "\n".join(
+            lines[: resource_index + 1] + [marker] + lines[resource_index + 1 :]
+        )
+        result, calls = self.run_orchestrator(
+            create={
+                "stack-core": {
+                    "id": "job-core-unknown-payload",
+                    "state": "FAILED",
+                    "logs": mixed_log,
+                },
+                "stack-small-01": {
+                    "id": "job-small01-should-not-start",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            }
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core"],
+        )
+
     def test_variable_plan_prelude_routes_core_then_small01(self):
         result, calls = self.run_orchestrator(
             jobs={
@@ -1168,6 +1292,88 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             [call[4] for call in creates],
             ["stack-core", "stack-small-01"],
         )
+
+    def test_structurally_unknown_core_pre_error_records_stop_before_small01_fallback(self):
+        positions = (
+            ("start", 0),
+            ("provider-and-plan-prelude", 6),
+            ("immediately-before-capacity", None),
+        )
+        for marker in _pre_error_marker_rows("2026/10/28 04:09:38"):
+            for position, line_index in positions:
+                with self.subTest(marker=marker, position=position):
+                    if line_index is None:
+                        mixed_log = _insert_before_first_message(
+                            FULL_CAPACITY_LOG,
+                            "Error: 500-InternalError",
+                            marker,
+                        )
+                    else:
+                        mixed_log = _insert_at_line(FULL_CAPACITY_LOG, line_index, marker)
+                    result, calls = self.run_orchestrator(
+                        create={
+                            "stack-core": {
+                                "id": "job-core-unknown-prelude",
+                                "state": "FAILED",
+                                "logs": mixed_log,
+                            },
+                            "stack-small-01": {
+                                "id": "job-small01-should-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        }
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core"],
+                    )
+
+    def test_structurally_unknown_small_console_pre_error_records_stop_before_small01_retry(self):
+        positions = (
+            ("start", 0),
+            ("inside-first-provider-attempt", 7),
+            ("immediately-before-provider-failure", None),
+        )
+        for marker in _pre_error_marker_rows("2026/08/07 15:26:44"):
+            for position, line_index in positions:
+                with self.subTest(marker=marker, position=position):
+                    if line_index is None:
+                        mixed_log = _insert_before_first_message(
+                            SMALL01_CONSOLE_LOG,
+                            "Error: Failed to install provider",
+                            marker,
+                        )
+                    else:
+                        mixed_log = _insert_at_line(SMALL01_CONSOLE_LOG, line_index, marker)
+                    result, calls = self.run_orchestrator(
+                        jobs={
+                            "stack-core": [
+                                _job("job-core-old-capacity", logs=FULL_CAPACITY_LOG)
+                            ],
+                            "stack-small-01": [
+                                _job("job-small01-unknown-prelude", logs=mixed_log)
+                            ],
+                        },
+                        create={
+                            "stack-core": {
+                                "id": "job-core-new-capacity",
+                                "state": "FAILED",
+                                "logs": FULL_CAPACITY_LOG,
+                            },
+                            "stack-small-01": {
+                                "id": "job-small01-should-not-start",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        },
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-core"],
+                    )
 
     def test_full_small01_provider_log_formats_allow_core_then_small01_fallback(self):
         for log_format, small01_log in (
