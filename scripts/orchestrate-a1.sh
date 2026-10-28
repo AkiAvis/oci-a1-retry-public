@@ -69,7 +69,7 @@ has_active_job() {
 
 ordered_job_history() {
   local stack_id="$1" jobs
-  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --sort-by TIMECREATED --sort-order DESC --output json 2>&1)" || return 1
+  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --limit "$PROVIDER_TIMEOUT_MAX_CONSECUTIVE" --sort-by TIMECREATED --sort-order DESC --output json 2>&1)" || return 1
   jq -e '.data | type == "array"' >/dev/null 2>/dev/null <<<"$jobs" || return 1
   printf '%s\n' "$jobs"
 }

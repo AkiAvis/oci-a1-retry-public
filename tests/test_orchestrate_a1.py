@@ -370,10 +370,14 @@ class OrchestrateA1TestCase(unittest.TestCase):
 
                     if args[:3] == ["resource-manager", "job", "list"]:
                         stack_id = option("--stack-id")
-                        if "--sort-by" in args and config["history_failures"].get(stack_id):
-                            print("simulated history failure", file=sys.stderr)
-                            raise SystemExit(8)
-                        print(json.dumps(dict(data=config["jobs"].get(stack_id, [])), separators=(",", ":")))
+                        jobs = config["jobs"].get(stack_id, [])
+                        if "--sort-by" in args:
+                            if config["history_failures"].get(stack_id):
+                                print("simulated history failure", file=sys.stderr)
+                                raise SystemExit(8)
+                            if "--limit" in args:
+                                jobs = jobs[: int(option("--limit"))]
+                        print(json.dumps(dict(data=jobs), separators=(",", ":")))
                     elif args[:3] == ["resource-manager", "job", "get"]:
                         job_id = option("--job-id")
                         if config["state_failures"].get(job_id):
@@ -517,6 +521,43 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 ["--output", "json", "--query", "data", "--raw-output"],
             )
 
+    def test_history_read_is_bounded_and_active_job_scan_stays_unbounded(self):
+        result, calls = self.run_orchestrator()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        list_calls = [
+            call
+            for call in calls
+            if call[:3] == ["resource-manager", "job", "list"]
+        ]
+        active_calls = [call for call in list_calls if "--sort-by" not in call]
+        history_calls = [call for call in list_calls if "--sort-by" in call]
+
+        self.assertEqual(len(active_calls), 3)
+        for call in active_calls:
+            self.assertIn("--all", call)
+        self.assertEqual(
+            history_calls,
+            [
+                [
+                    "resource-manager",
+                    "job",
+                    "list",
+                    "--stack-id",
+                    "stack-core",
+                    "--limit",
+                    "3",
+                    "--sort-by",
+                    "TIMECREATED",
+                    "--sort-order",
+                    "DESC",
+                    "--output",
+                    "json",
+                ]
+            ],
+        )
+        self.assertNotIn("--all", history_calls[0])
+
     def test_malformed_or_wrong_log_payloads_fail_closed_without_extra_apply(self):
         payloads = (
             ("malformed-json", '{"data":'),
@@ -578,7 +619,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.create_calls(calls))
 
-    def test_three_consecutive_provider_timeouts_stop_across_history(self):
+    def test_three_consecutive_provider_timeouts_stop_even_with_older_capacity(self):
         result, calls = self.run_orchestrator(
             inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
             jobs={
@@ -586,6 +627,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     _job("job-timeout-3", logs=TIMEOUT_LOG),
                     _job("job-timeout-2", logs=TIMEOUT_LOG),
                     _job("job-timeout-1", logs=TIMEOUT_LOG),
+                    _job("job-older-capacity", logs="Out of host capacity"),
                 ],
             },
             create={
@@ -1355,6 +1397,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     _job("job-timeout-2", logs=TIMEOUT_LOG),
                     _job("job-timeout-1", logs=TIMEOUT_LOG),
                     _job("job-capacity", logs="Out of host capacity"),
+                    _job("job-older-unknown", logs="untrusted older diagnostic"),
                 ],
             },
             create={
@@ -1368,6 +1411,46 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.create_calls(calls)), 1)
+
+    def test_newest_capacity_ignores_older_unknown_history(self):
+        result, calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [
+                    _job("job-newest-capacity", logs="Out of host capacity"),
+                    _job("job-older-timeout-1", logs=TIMEOUT_LOG),
+                    _job("job-older-timeout-2", logs=TIMEOUT_LOG),
+                    _job("job-older-unknown", logs="untrusted older diagnostic"),
+                ],
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[4] for call in self.create_calls(calls)], ["stack-core"])
+        self.assertFalse(any("job-older-unknown" in call for call in self.log_calls(calls)))
+
+    def test_malformed_history_entry_within_first_three_stops(self):
+        result, calls = self.run_orchestrator(
+            inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+            jobs={
+                "stack-small-02": [
+                    _job("job-timeout-1", logs=TIMEOUT_LOG),
+                    _job("job-timeout-2", logs=TIMEOUT_LOG),
+                    _job("job-malformed", operation="PLAN", logs=TIMEOUT_LOG),
+                    _job("job-older-capacity", logs="Out of host capacity"),
+                ],
+            },
+            create={
+                "stack-small-02": {
+                    "id": "job-small02-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                }
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("history_invalid", result.stderr)
+        self.assertFalse(self.create_calls(calls))
 
     def test_timeout_budget_is_enforced_across_independent_invocations(self):
         for history_length in (1, 2, 3):
