@@ -104,6 +104,7 @@ classify_failure_records() {
     BEGIN {
       seen_blocks = 0
       post_provider = 0
+      saw_nonempty_prelude = 0
     }
 
     function trim(value) {
@@ -151,6 +152,17 @@ classify_failure_records() {
 
     function known_provider_boundary(message) {
       return known_provider_retry_prelude(message) || message == "Error: Failed to install provider"
+    }
+
+    function prelude_failure_marker(message) {
+      lower = tolower(message)
+      if (lower ~ /(^|[^[:alnum:]_])(invalidparameter|invalid[[:space:]]+parameter|account[[:space:]]+is[[:space:]]+disabled|accountsuspend[[:alpha:]]*|licensesuspend[[:alpha:]]*|serviceunavailable|notauthorized[[:alpha:]]*|suspend[[:alpha:]]*|unauthor[[:alpha:]]*|forbidden|deni[[:alpha:]]*|reject[[:alpha:]]*|revok[[:alpha:]]*|fatal|failure[[:alpha:]]*|failed|exception[[:alpha:]]*|timeout[[:alpha:]]*|timed[[:space:]]+out|unavailable|quota|limit[[:space:]]+exceed[[:alpha:]]*|too[[:space:]]+many[[:space:]]+requests|error[[:alpha:]]*)([^[:alnum:]_]|$)/) {
+        return 1
+      }
+      if (lower ~ /(^|[^0-9])(401|403|429|500)([^0-9]|$)/) {
+        return 1
+      }
+      return 0
     }
 
     function finalize_block() {
@@ -319,17 +331,18 @@ classify_failure_records() {
       }
 
       if (message == "") next
+      if (bare_capacity > 0) {
+        invalid = 1
+        next
+      }
       if (level == "" && message ~ /^Out of host capacity[.]?$/) {
+        if (saw_nonempty_prelude) invalid = 1
         bare_capacity++
         next
       }
       if (seen_blocks == 0) {
-        # Recognize only unambiguous auth/account failure phrases here; other
-        # prelude text has no reliable schema and cannot be semantically classified.
-        lower = tolower(message)
-        if (lower ~ /(^|[^[:alnum:]_])credentials[[:space:]]+rejected([^[:alnum:]_]|$)/ ||
-            lower ~ /(^|[^[:alnum:]_])account[[:space:]]+is[[:space:]]+disabled([^[:alnum:]_]|$)/ ||
-            lower ~ /(^|[^[:alnum:]_])access[[:space:]]+revoked([^[:alnum:]_]|$)/) invalid = 1
+        if (prelude_failure_marker(message)) invalid = 1
+        saw_nonempty_prelude = 1
         next
       }
       if (post_provider && known_provider_retry_prelude(message)) next

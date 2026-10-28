@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -269,6 +270,53 @@ UNKEYWORDED_INFO_DIAGNOSTICS = (
     "Access revoked",
     "LicenseSuspended",
 )
+
+
+def _redact_private_log(text: str) -> str:
+    text = re.sub(r"\bocid1\.[A-Za-z0-9._-]+\b", "<redacted-ocid>", text)
+    text = re.sub(
+        r"(?i)(opc(?:[- ]+request[- ]+id)\s*[:=]\s*)\S+",
+        r"\1<redacted-request-id>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)ssh-(?:rsa|ed25519)\s+[A-Za-z0-9+/=]+(?:\s+\S+)?",
+        "<redacted-public-key>",
+        text,
+    )
+    return text
+
+
+def _load_private_downloaded_logs() -> tuple[str, str]:
+    root_value = os.environ.get("OCI_A1_RETRY_LOG_DIR")
+    if not root_value:
+        raise unittest.SkipTest("set OCI_A1_RETRY_LOG_DIR for private downloaded-log replay")
+
+    root = Path(root_value)
+    if not root.is_dir():
+        raise AssertionError("OCI_A1_RETRY_LOG_DIR is not a directory")
+
+    core_candidates = []
+    small_candidates = []
+    for path in root.glob("*.log"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        line_count = len(text.splitlines())
+        if (
+            line_count == 208
+            and "Out of host capacity" in text
+            and "Failed to install provider" not in text
+        ):
+            core_candidates.append(text)
+        if (
+            line_count == 54
+            and "Failed to install provider" in text
+            and "Out of host capacity" not in text
+        ):
+            small_candidates.append(text)
+
+    if len(core_candidates) != 1 or len(small_candidates) != 1:
+        raise AssertionError("could not identify the two supplied downloaded logs")
+    return _redact_private_log(core_candidates[0]), _redact_private_log(small_candidates[0])
 
 
 def _make_executable(path: Path, content: str) -> None:
@@ -981,6 +1029,113 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertEqual(
             [call[4] for call in creates],
             ["stack-core", "stack-small-01"],
+        )
+
+    def test_private_downloaded_full_logs_and_pre_error_markers_fail_closed(self):
+        core_log, small_log = _load_private_downloaded_logs()
+
+        normal_result, normal_calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-private-core-old", logs=core_log)],
+                "stack-small-01": [_job("job-private-small-old", logs=small_log)],
+            },
+            create={
+                "stack-core": {
+                    "id": "job-private-core-new",
+                    "state": "FAILED",
+                    "logs": core_log,
+                },
+                "stack-small-01": {
+                    "id": "job-private-small-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            },
+        )
+        self.assertEqual(normal_result.returncode, 0, normal_result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(normal_calls)],
+            ["stack-core", "stack-small-01"],
+        )
+
+        marker_cases = (
+            ("core-before", "core", "before", "2026/10/28 04:09:38", "InvalidParameter"),
+            ("core-after", "core", "after", "2026/10/28 04:09:38", "InvalidParameter"),
+            ("small-before", "small", "before", "2026/08/07 15:26:44", "AccountSuspended"),
+            ("small-after", "small", "after", "2026/08/07 15:26:44", "AccountSuspended"),
+        )
+        for label, block_name, position, timestamp, marker_text in marker_cases:
+            with self.subTest(label=label):
+                marker = _bracket_row(timestamp, "INFO", marker_text)
+                block = core_log if block_name == "core" else small_log
+                mixed_log = (
+                    marker + "\n" + block
+                    if position == "before"
+                    else block + "\n" + marker
+                )
+
+                if block_name == "core":
+                    result, calls = self.run_orchestrator(
+                        create={
+                            "stack-core": {
+                                "id": "job-private-core-marker",
+                                "state": "FAILED",
+                                "logs": mixed_log,
+                            },
+                            "stack-small-01": {
+                                "id": "job-private-small-new",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        }
+                    )
+                else:
+                    result, calls = self.run_orchestrator(
+                        jobs={
+                            "stack-core": [_job("job-private-core-old", logs=core_log)],
+                            "stack-small-01": [
+                                _job("job-private-small-marker", logs=mixed_log)
+                            ],
+                        },
+                        create={
+                            "stack-core": {
+                                "id": "job-private-core-new",
+                                "state": "FAILED",
+                                "logs": core_log,
+                            },
+                            "stack-small-01": {
+                                "id": "job-private-small-new",
+                                "state": "SUCCEEDED",
+                                "logs": "",
+                            },
+                        },
+                    )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-core"],
+                )
+
+        result, calls = self.run_orchestrator(
+            create={
+                "stack-core": {
+                    "id": "job-private-bare-marker",
+                    "state": "FAILED",
+                    "logs": "Out of host capacity\n"
+                    + _bracket_row("2026/10/28 04:09:38", "INFO", "InvalidParameter"),
+                },
+                "stack-small-01": {
+                    "id": "job-private-small-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            }
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            ["stack-core"],
         )
 
     def test_variable_plan_prelude_routes_core_then_small01(self):
