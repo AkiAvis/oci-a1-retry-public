@@ -304,6 +304,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         create=None,
         history_failures=None,
         log_failures=None,
+        log_outputs=None,
         state_failures=None,
         state_overrides=None,
         extra_env=None,
@@ -315,6 +316,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         }
         history_failures = history_failures or {}
         log_failures = log_failures or {}
+        log_outputs = log_outputs or {}
         state_failures = state_failures or {}
         state_overrides = state_overrides or {}
 
@@ -329,6 +331,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
                         "create": create,
                         "history_failures": history_failures,
                         "log_failures": log_failures,
+                        "log_outputs": log_outputs,
                         "state_failures": state_failures,
                         "state_overrides": state_overrides,
                     }
@@ -354,6 +357,16 @@ class OrchestrateA1TestCase(unittest.TestCase):
                     def option(name):
                         index = args.index(name)
                         return args[index + 1]
+
+                    def print_log_response(logs):
+                        output = option("--output") if "--output" in args else "json"
+                        query = option("--query") if "--query" in args else None
+                        if output == "json" and query == "data" and "--raw-output" in args:
+                            print(logs, end="")
+                        elif output == "json" and query == "data":
+                            print(json.dumps(logs, separators=(",", ":")))
+                        else:
+                            print(json.dumps(dict(data=logs), separators=(",", ":")))
 
                     if args[:3] == ["resource-manager", "job", "list"]:
                         stack_id = option("--stack-id")
@@ -381,17 +394,23 @@ class OrchestrateA1TestCase(unittest.TestCase):
                         print(state)
                     elif args[:3] == ["resource-manager", "job", "get-job-logs-content"]:
                         job_id = option("--job-id")
+                        if job_id in config["log_outputs"]:
+                            override = config["log_outputs"][job_id]
+                            if override.get("stderr"):
+                                print(override["stderr"], file=sys.stderr)
+                            print(override.get("stdout", ""), end="")
+                            raise SystemExit(override.get("returncode", 0))
                         if config["log_failures"].get(job_id):
                             print("simulated log failure", file=sys.stderr)
                             raise SystemExit(11)
                         for stack_jobs in config["jobs"].values():
                             for job in stack_jobs:
                                 if job["id"] == job_id:
-                                    print(job.get("logs", ""), end="")
+                                    print_log_response(job.get("logs", ""))
                                     raise SystemExit(0)
                         for create_job in config["create"].values():
                             if create_job.get("id") == job_id:
-                                print(create_job.get("logs", ""), end="")
+                                print_log_response(create_job.get("logs", ""))
                                 raise SystemExit(0)
                         print("unknown job", file=sys.stderr)
                         raise SystemExit(12)
@@ -462,8 +481,66 @@ class OrchestrateA1TestCase(unittest.TestCase):
             if call[:3] == ["resource-manager", "job", "create-apply-job"]
         ]
 
+    @staticmethod
+    def log_calls(calls):
+        return [
+            call
+            for call in calls
+            if call[:3] == ["resource-manager", "job", "get-job-logs-content"]
+        ]
+
 
 class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
+    def test_log_download_requests_query_and_raw_output_for_both_paths(self):
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-old-capacity", logs=CAPACITY_LOG)]},
+            create={
+                "stack-core": {
+                    "id": "job-core-new",
+                    "state": "FAILED",
+                    "logs": CAPACITY_LOG,
+                },
+                "stack-small-01": {
+                    "id": "job-small01-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                },
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log_calls = self.log_calls(calls)
+        self.assertEqual(len(log_calls), 2)
+        for call in log_calls:
+            self.assertEqual(
+                call[5:],
+                ["--output", "json", "--query", "data", "--raw-output"],
+            )
+
+    def test_malformed_or_wrong_log_payloads_fail_closed_without_extra_apply(self):
+        payloads = (
+            ("malformed-json", '{"data":'),
+            ("missing-data", '{"message":"unexpected response"}'),
+            ("null-data", '{"data":null}'),
+            ("array-data", '{"data":[]}'),
+            ("object-data", '{"data":{}}'),
+            ("json-string", json.dumps(TIMEOUT_LOG)),
+        )
+        for label, payload in payloads:
+            with self.subTest(label=label):
+                job_id = f"job-invalid-payload-{label}"
+                result, calls = self.run_orchestrator(
+                    jobs={"stack-core": [_job(job_id, logs=TIMEOUT_LOG)]},
+                    log_outputs={job_id: {"stdout": payload}},
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.create_calls(calls))
+                self.assertEqual(
+                    self.log_calls(calls)[0][5:],
+                    ["--output", "json", "--query", "data", "--raw-output"],
+                )
+
     def test_provider_checksum_download_timeout_allows_retry_below_budget(self):
         result, calls = self.run_orchestrator(
             inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},

@@ -419,7 +419,7 @@ provider_timeout_history_allows() {
 
     case "$listed_state" in
       FAILED)
-        logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$id" 2>&1)" || stop_for_failure "$label" "$listed_state" "$id" log_unavailable
+        logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$id" --output json --query data --raw-output 2>&1)" || stop_for_failure "$label" "$listed_state" "$id" log_unavailable
         classification="$(failure_classification "$logs" "$allow_provider_timeout")" || stop_for_failure "$label" "$listed_state" "$id" unknown
         echo "Observed $label Apply history: diagnostic=$classification state=$listed_state job=$(safe_job_id "$id")." >&2
         case "$classification" in
@@ -569,7 +569,7 @@ wait_for_terminal() {
 
 failure_is_capacity() {
   local job_id="$1" logs classification
-  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" 2>&1)" || fail "Could not read failed-job logs."
+  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" --output json --query data --raw-output 2>&1)" || fail "Could not read failed-job logs."
   classification="$(failure_classification "$logs")" || return 1
   [[ "$classification" == capacity ]]
 }
