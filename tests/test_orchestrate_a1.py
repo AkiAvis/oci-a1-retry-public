@@ -16,14 +16,38 @@ SCRIPT = REPO / "scripts" / "orchestrate-a1.sh"
 BASELINE_COMMIT = "0b0dd9b049ac30761d04b0d6326e0bbccc1601b4"
 SCRATCH = Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
 
+OFFICIAL_PROVIDER_CHECKSUM_URL = (
+    "https://github.com/oracle/terraform-provider-oci/releases/download/"
+    "v8.26.0/terraform-provider-oci_8.26.0_SHA256SUMS"
+)
+
 TIMEOUT_LOG = "\n".join(
     [
         "Error: Failed to install provider",
         "failed to retrieve authentication checksums for provider: ",
-        "https://github.com/oracle/terraform-provider-oci/releases/download/v8.26.0/terraform-provider-oci_8.26.0_SHA256SUMS",
+        OFFICIAL_PROVIDER_CHECKSUM_URL,
         "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
     ]
 )
+
+
+def _provider_timeout_log(provider_version: str | None, url_version: str = "8.26.0") -> str:
+    url = OFFICIAL_PROVIDER_CHECKSUM_URL.replace("v8.26.0/", f"v{url_version}/")
+    url = url.replace("_8.26.0_SHA256SUMS", f"_{url_version}_SHA256SUMS")
+    lines = ["Error: Failed to install provider"]
+    if provider_version is not None:
+        lines.append(
+            f"Error while installing oracle/oci v{provider_version}: could not query provider registry"
+        )
+    lines.extend(
+        [
+            "failed to retrieve authentication checksums for provider: ",
+            url,
+            "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+        ]
+    )
+    return "\n".join(lines)
+
 
 CAPACITY_LOG = "\n".join(
     [
@@ -1516,6 +1540,266 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 self.assertEqual(
                     [call[4] for call in creates],
                     ["stack-core", "stack-small-01"],
+                )
+
+    def test_private_small_downloaded_checksum_url_versions_must_match(self):
+        _, small_log = _load_private_downloaded_logs()
+        self.assertEqual(len(small_log.splitlines()), 54)
+        self.assertEqual(small_log.count(OFFICIAL_PROVIDER_CHECKSUM_URL), 4)
+
+        variants = (
+            (
+                "artifact-version-mismatch",
+                small_log.replace("_8.26.0_SHA256SUMS", "_9.99.0_SHA256SUMS"),
+            ),
+            (
+                "release-version-mismatch",
+                small_log.replace("/v8.26.0/", "/v9.99.0/"),
+            ),
+        )
+
+        for label, modified_log in variants:
+            with self.subTest(label=label):
+                self.assertEqual(len(modified_log.splitlines()), 54)
+                self.assertEqual(modified_log.count("Failed to install provider"), 4)
+                result, calls = self.run_orchestrator(
+                    inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+                    jobs={"stack-small-02": [_job("job-small-url-version-mismatch", logs=modified_log)]},
+                    create={
+                        "stack-small-02": {
+                            "id": "job-small02-version-mismatch-must-not-start",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        }
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    [],
+                )
+
+    def test_synthetic_checksum_url_versions_allow_missing_or_matching_provider_version(self):
+        cases = (
+            ("missing-provider-version", TIMEOUT_LOG, True),
+            ("matching-provider-version", _provider_timeout_log("8.26.0"), True),
+            ("matching-nondefault-version", _provider_timeout_log("9.99.0", "9.99.0"), True),
+            ("mismatched-provider-version", _provider_timeout_log("9.99.0"), False),
+        )
+
+        for label, log, should_start in cases:
+            with self.subTest(label=label):
+                result, calls = self.run_orchestrator(
+                    inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+                    jobs={"stack-small-02": [_job("job-small-synthetic-url-version", logs=log)]},
+                    create={
+                        "stack-small-02": {
+                            "id": "job-small02-synthetic-url-version",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        }
+                    },
+                )
+                if should_start:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        ["stack-small-02"],
+                    )
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        [call[4] for call in self.create_calls(calls)],
+                        [],
+                    )
+
+    def test_private_small_downloaded_checksum_url_spoofs_stop_without_small02_target(self):
+        _, small_log = _load_private_downloaded_logs()
+        self.assertEqual(len(small_log.splitlines()), 54)
+        self.assertEqual(small_log.count(OFFICIAL_PROVIDER_CHECKSUM_URL), 4)
+
+        variants = (
+            (
+                "wrong-origin-query",
+                "https://downloads.example.invalid/fetch?upstream="
+                + OFFICIAL_PROVIDER_CHECKSUM_URL,
+            ),
+            ("unknown-trailing-diagnostic", OFFICIAL_PROVIDER_CHECKSUM_URL + " AccountSuspended"),
+            ("checksum-artifact-suffix", OFFICIAL_PROVIDER_CHECKSUM_URL + ".unexpected"),
+            (
+                "spoofed-prefix",
+                "https://evil.example.invalid/prefix/" + OFFICIAL_PROVIDER_CHECKSUM_URL,
+            ),
+            ("query", OFFICIAL_PROVIDER_CHECKSUM_URL + "?download=1"),
+            (
+                "port",
+                OFFICIAL_PROVIDER_CHECKSUM_URL.replace(
+                    "https://github.com/", "https://github.com:443/"
+                ),
+            ),
+            (
+                "credentials",
+                OFFICIAL_PROVIDER_CHECKSUM_URL.replace(
+                    "https://github.com/", "https://example-user:example-pass" + "@" + "github.com/"
+                ),
+            ),
+            (
+                "userinfo-host-spoof",
+                OFFICIAL_PROVIDER_CHECKSUM_URL.replace(
+                    "https://github.com/", "https://github.com" + "@" + "evil.example.invalid/"
+                ),
+            ),
+            ("fragment", OFFICIAL_PROVIDER_CHECKSUM_URL + "#artifact"),
+        )
+
+        for label, replacement in variants:
+            with self.subTest(label=label):
+                modified_log = small_log.replace(OFFICIAL_PROVIDER_CHECKSUM_URL, replacement)
+                result, calls = self.run_orchestrator(
+                    inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+                    jobs={"stack-small-02": [_job("job-small-url-spoof", logs=modified_log)]},
+                    create={
+                        "stack-small-02": {
+                            "id": "job-small02-must-not-start",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        }
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    [],
+                )
+
+        malformed_log = small_log.replace(
+            f'"{OFFICIAL_PROVIDER_CHECKSUM_URL}":',
+            f'"{OFFICIAL_PROVIDER_CHECKSUM_URL}:',
+        )
+        result, calls = self.run_orchestrator(
+            inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+            jobs={"stack-small-02": [_job("job-small-url-malformed", logs=malformed_log)]},
+            create={
+                "stack-small-02": {
+                    "id": "job-small02-malformed-must-not-start",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                }
+            },
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(calls)],
+            [],
+        )
+
+    def test_private_small_downloaded_valid_checksum_forms_start_exact_small02_target(self):
+        _, small_log = _load_private_downloaded_logs()
+        valid_logs = (
+            ("downloaded-quoted-url-colon", small_log),
+            ("bare-url", TIMEOUT_LOG),
+            ("cli-wrapped-quoted-url-colon", SMALL01_CLI_WRAPPED_LOG),
+        )
+
+        for label, log in valid_logs:
+            with self.subTest(label=label):
+                result, calls = self.run_orchestrator(
+                    inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+                    jobs={"stack-small-02": [_job("job-small-valid-url", logs=log)]},
+                    create={
+                        "stack-small-02": {
+                            "id": "job-small02-valid-url",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        }
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-small-02"],
+                )
+
+    def test_small_capacity_unknown_warn_stays_closed_while_baseline_keeps_target(self):
+        core_log, _ = _load_private_downloaded_logs()
+        warned_log = _insert_before_first_message(
+            core_log,
+            "Error: 500-InternalError",
+            _bracket_row(
+                "2026/10/28 04:09:50",
+                "WARN",
+                "Harmless provider prelude notice",
+            ),
+        )
+
+        candidate_result, candidate_calls = self.run_orchestrator(
+            inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+            jobs={"stack-small-02": [_job("job-small-warn", logs=warned_log)]},
+            create={
+                "stack-small-02": {
+                    "id": "job-small02-warn-must-not-start",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                }
+            },
+        )
+        self.assertNotEqual(candidate_result.returncode, 0, candidate_result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(candidate_calls)],
+            [],
+        )
+
+        baseline_result, baseline_calls = self.run_orchestrator(
+            inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+            jobs={"stack-small-02": [_job("job-small-warn-baseline", logs=warned_log)]},
+            create={
+                "stack-small-02": {
+                    "id": "job-small02-warn-baseline",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                }
+            },
+            script_text=_baseline_script_text(),
+        )
+        self.assertEqual(baseline_result.returncode, 0, baseline_result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(baseline_calls)],
+            ["stack-small-02"],
+        )
+
+    def test_small_capacity_terraform_progress_keeps_exact_target_like_baseline(self):
+        core_log, _ = _load_private_downloaded_logs()
+        progress_log = _insert_before_first_message(
+            core_log,
+            "Error: 500-InternalError",
+            _bracket_row(
+                "2026/10/28 04:09:50",
+                "INFO",
+                "oci_core_instance.generated_oci_core_instance: Still creating... [10s elapsed]",
+            ),
+        )
+
+        for label, script_text in (
+            ("candidate", None),
+            ("baseline", _baseline_script_text()),
+        ):
+            with self.subTest(label=label):
+                result, calls = self.run_orchestrator(
+                    inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+                    jobs={"stack-small-02": [_job("job-small-progress", logs=progress_log)]},
+                    create={
+                        "stack-small-02": {
+                            "id": "job-small02-progress",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        }
+                    },
+                    script_text=script_text,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(calls)],
+                    ["stack-small-02"],
                 )
 
     def test_small01_provider_timeout_plus_unknown_error_stops(self):

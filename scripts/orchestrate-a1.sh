@@ -123,6 +123,8 @@ classify_failure_records() {
       block_checksums = 0
       block_official_url = 0
       block_deadline = 0
+      block_provider_version = ""
+      block_url_version = ""
     }
 
     function known_provider_retry_prelude(message) {
@@ -192,6 +194,36 @@ classify_failure_records() {
       return 0
     }
 
+    function official_provider_checksum_url_shape(message) {
+      return message ~ /^https:[/][/]github[.]com[/]oracle[/]terraform-provider-oci[/]releases[/]download[/]v[0-9][A-Za-z0-9._-]*[/]terraform-provider-oci_[0-9][A-Za-z0-9._-]*_SHA256SUMS$/ ||
+             message ~ /^"https:[/][/]github[.]com[/]oracle[/]terraform-provider-oci[/]releases[/]download[/]v[0-9][A-Za-z0-9._-]*[/]terraform-provider-oci_[0-9][A-Za-z0-9._-]*_SHA256SUMS":$/
+    }
+
+    function checksum_url_version(message,   url, prefix, suffix, rest, slash, release_version, artifact, artifact_prefix, artifact_version) {
+      if (!official_provider_checksum_url_shape(message)) return ""
+      url = message
+      if (url ~ /^"/) {
+        sub(/^"/, "", url)
+        sub(/"[:]$/, "", url)
+      }
+      prefix = "https://github.com/oracle/terraform-provider-oci/releases/download/v"
+      suffix = "_SHA256SUMS"
+      artifact_prefix = "terraform-provider-oci_"
+      rest = substr(url, length(prefix) + 1)
+      slash = index(rest, "/")
+      release_version = substr(rest, 1, slash - 1)
+      artifact = substr(rest, slash + 1)
+      artifact_version = substr(artifact, length(artifact_prefix) + 1,
+                                length(artifact) - length(artifact_prefix) - length(suffix))
+      if (release_version != artifact_version) return ""
+      return release_version
+    }
+
+    function official_provider_checksum_url(message, expected_provider_version,   version) {
+      version = checksum_url_version(message)
+      return version != "" && (expected_provider_version == "" || version == expected_provider_version)
+    }
+
     function known_provider_boundary(message) {
       return known_provider_retry_prelude(message) || message == "Error: Failed to install provider"
     }
@@ -231,6 +263,7 @@ classify_failure_records() {
         return 1
       }
       if (message ~ /^[A-Za-z0-9_.-]+([.][A-Za-z0-9_.-]+)*:[[:space:]]+(Creating|Created|Modifying|Modified|Destroying|Destroyed|Refreshing state)([.][.][.]|[[:space:]])$/ ||
+          message ~ /^[A-Za-z0-9_.-]+([.][A-Za-z0-9_.-]+)*:[[:space:]]+Still creating[.][.][.][[:space:]]+[[][0-9]+s[[:space:]]+elapsed[]]$/ ||
           message ~ /^Refreshing state[.][.][.]$/) {
         return 1
       }
@@ -279,6 +312,9 @@ classify_failure_records() {
       if (!block_open) return
 
       if (block_kind == "provider") {
+        if (block_provider_version != "" && block_url_version != "" && block_provider_version != block_url_version) {
+          block_invalid = 1
+        }
         if (block_authentication && block_checksums && block_official_url && block_deadline && !block_invalid) {
           timeout_blocks++
           seen_blocks++
@@ -306,7 +342,7 @@ classify_failure_records() {
       reset_block()
     }
 
-    function consume_message(message) {
+    function consume_message(message,   provider_version, url_version) {
       if (message == "") return
 
       if (block_kind == "") {
@@ -332,9 +368,16 @@ classify_failure_records() {
           block_checksums = 1
           return
         }
-        if (message ~ /https:[/][/]github[.]com[/]oracle[/]terraform-provider-oci[/]releases[/]download[/]v[0-9][A-Za-z0-9._-]*[/]terraform-provider-oci_[0-9A-Za-z._-]+_SHA256SUMS/) {
+        if (official_provider_checksum_url_shape(message)) {
+          if (!official_provider_checksum_url(message, block_provider_version)) {
+            block_invalid = 1
+            return
+          }
           if (!block_checksums || block_official_url) block_invalid = 1
+          url_version = checksum_url_version(message)
+          if (block_provider_version != "" && block_provider_version != url_version) block_invalid = 1
           block_official_url = 1
+          block_url_version = url_version
           return
         }
         if (message ~ /https:[/][/][^[:space:]]*SHA256SUMS/) {
@@ -346,7 +389,16 @@ classify_failure_records() {
           block_deadline = 1
           return
         }
-        if (message ~ /^Error while installing oracle[/]oci v[0-9A-Za-z._-]+: could not query provider registry$/ || message == "could not query provider registry" || message == "later: Get") {
+        if (message ~ /^Error while installing oracle[/]oci v[0-9A-Za-z._-]+: could not query provider registry$/) {
+          provider_version = message
+          sub(/^Error while installing oracle[/]oci v/, "", provider_version)
+          sub(/: could not query provider registry$/, "", provider_version)
+          if (block_provider_version != "" && block_provider_version != provider_version) block_invalid = 1
+          if (block_url_version != "" && block_url_version != provider_version) block_invalid = 1
+          block_provider_version = provider_version
+          return
+        }
+        if (message == "could not query provider registry" || message == "later: Get") {
           return
         }
         if (message ~ /Out of host capacity/) {
@@ -388,6 +440,8 @@ classify_failure_records() {
         block_checksums = 0
         block_official_url = 0
         block_deadline = 0
+        block_provider_version = ""
+        block_url_version = ""
       }
       if (level == "ERROR") block_has_error_level = 1
       consume_message(message)
