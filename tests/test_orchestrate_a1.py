@@ -366,6 +366,16 @@ def _redact_private_log(text: str) -> str:
     return text
 
 
+def _downloaded_to_observed_cli_text(text: str) -> str:
+    """Reproduce the observed OCI CLI 3.95.1 line renderer in memory."""
+    return re.sub(
+        r"^\[([^\]]+)\] (INFO|ERROR|WARN) - (.*)$",
+        r"\1[TERRAFORM_CONSOLE] [\2] \3",
+        text,
+        flags=re.MULTILINE,
+    )
+
+
 def _load_private_downloaded_logs() -> tuple[str, str]:
     root_value = os.environ.get("OCI_A1_RETRY_LOG_DIR")
     if not root_value:
@@ -1206,6 +1216,52 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             ["stack-core", "stack-small-01"],
         )
 
+    def test_observed_cli_rendered_full_logs_route_core_then_small01(self):
+        core_log, small_log = _load_private_downloaded_logs()
+        cli_core = _downloaded_to_observed_cli_text(core_log)
+        cli_small = _downloaded_to_observed_cli_text(small_log)
+        self.assertEqual(len(cli_core.splitlines()), 208)
+        self.assertEqual(len(cli_small.splitlines()), 54)
+
+        result, calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-cli-core-old", logs=cli_core)],
+                "stack-small-01": [_job("job-cli-small-old", logs=cli_small)],
+            },
+            create={
+                "stack-core": {"id": "job-cli-core-new", "state": "FAILED", "logs": cli_core},
+                "stack-small-01": {"id": "job-cli-small-new", "state": "SUCCEEDED", "logs": ""},
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call[4] for call in self.create_calls(calls)], ["stack-core", "stack-small-01"])
+
+    def test_observed_cli_log_wrappers_fail_closed_when_malformed_or_unknown(self):
+        core_log, small_log = _load_private_downloaded_logs()
+        cli_core = _downloaded_to_observed_cli_text(core_log)
+        cli_small = _downloaded_to_observed_cli_text(small_log)
+        first = next(line for line in cli_small.splitlines() if "[INFO]" in line)
+        variants = (
+            ("unknown-severity", cli_small.replace(first, first.replace("[INFO]", "[TRACE]", 1), 1)),
+            ("malformed-wrapper", cli_small.replace(first, first.replace("[TERRAFORM_CONSOLE]", "[UNKNOWN_SOURCE]", 1), 1)),
+            ("mixed-unknown-error", cli_small + "\n2026/08/07 15:26:45[TERRAFORM_CONSOLE] [ERROR] Error: NotAuthorizedOrNotFound"),
+        )
+        for label, variant in variants:
+            with self.subTest(label=label):
+                result, calls = self.run_orchestrator(
+                    jobs={
+                        "stack-core": [_job("job-cli-history-core", logs=cli_core)],
+                        "stack-small-01": [_job("job-cli-history-small", logs=variant)],
+                    },
+                    create={
+                        "stack-core": {"id": "job-cli-invalid-core", "state": "FAILED", "logs": cli_core},
+                        "stack-small-01": {"id": "job-cli-small-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([call[4] for call in self.create_calls(calls)], ["stack-core"])
+
     def test_known_unsolved_core_baseline_bypass_private_core_markers_small_markers_still_stop(self):
         core_log, small_log = _load_private_downloaded_logs()
 
@@ -1454,6 +1510,36 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         [call[4] for call in self.create_calls(fresh_calls)],
                         ["stack-core"],
                     )
+
+    def test_observed_cli_wrapped_core_errors_block_history_and_fresh_fallback(self):
+        core_log, _ = _load_private_downloaded_logs()
+        cli_core = _downloaded_to_observed_cli_text(core_log)
+        for record in (
+            "2026/10/29 04:09:38[TERRAFORM_CONSOLE] [ERROR] NotAuthorizedOrNotFound",
+            "2026/10/29 04:09:38[TERRAFORM_CONSOLE] [INFO] Account suspended",
+            "2026/10/29 04:09:38[UNKNOWN_SOURCE] [ERROR] NotAuthorizedOrNotFound",
+            "2026/10/29 04:09:38[TERRAFORM_CONSOLE] [TRACE] NotAuthorizedOrNotFound",
+        ):
+            with self.subTest(record=record):
+                mixed_log = cli_core + "\n" + record
+                historical_result, historical_calls = self.run_orchestrator(
+                    jobs={"stack-core": [_job("job-observed-core-history", logs=mixed_log)]},
+                    create={
+                        "stack-core": {"id": "job-history-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                        "stack-small-01": {"id": "job-small-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                    },
+                )
+                self.assertNotEqual(historical_result.returncode, 0)
+                self.assertFalse(self.create_calls(historical_calls))
+
+                fresh_result, fresh_calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {"id": "job-observed-core-fresh", "state": "FAILED", "logs": mixed_log},
+                        "stack-small-01": {"id": "job-small-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                    }
+                )
+                self.assertNotEqual(fresh_result.returncode, 0)
+                self.assertEqual([call[4] for call in self.create_calls(fresh_calls)], ["stack-core"])
 
     def test_core_safety_parser_nonzero_status_fails_closed_for_history_and_fresh_failure(self):
         core_log, _ = _load_private_downloaded_logs()

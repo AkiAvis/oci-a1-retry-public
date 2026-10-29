@@ -258,6 +258,21 @@ core_mixed_serious_error_present() {
       raw = $0
       sub(/\r$/, "", raw)
 
+      if (substr(raw, 20, 1) == "[") {
+        wrapper = "[TERRAFORM_CONSOLE] ["
+        if (substr(raw, 20, length(wrapper)) != wrapper) {
+          serious = 1
+        } else {
+          level_start = 20 + length(wrapper)
+          level_end = index(substr(raw, level_start), "] ")
+          if (level_end == 0) serious = 1
+          else {
+            level = substr(raw, level_start, level_end - 1)
+            if (level != "INFO" && level != "WARN" && level != "ERROR") serious = 1
+            else raw = substr(raw, 1, 19) "\t" level "\t" substr(raw, level_start + level_end + 1)
+          }
+        }
+      }
       json_line = raw
       if (json_line ~ json_bracket_prefix) {
         sub(json_bracket_prefix, "", json_line)
@@ -339,6 +354,19 @@ core_mixed_serious_error_present() {
 
 classify_failure_records() {
   local logs="$1"
+  # OCI CLI 3.95.1 renders selected raw log rows as timestamp[source] [LEVEL] text.
+  # Normalize only the observed source and known levels; malformed wrappers remain
+  # untouched so the classifier rejects them rather than dropping metadata.
+  logs="$(awk '
+    {
+      raw = $0
+      if (raw ~ /^[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\[TERRAFORM_CONSOLE\][[:space:]]+\[(INFO|WARN|ERROR)\][[:space:]]/) {
+        sub(/\[TERRAFORM_CONSOLE\][[:space:]]+\[/, "\t", raw)
+        sub(/\][[:space:]]+/, "\t", raw)
+      }
+      print raw
+    }
+  ' <<<"$logs")"
   awk '
     BEGIN {
       seen_blocks = 0

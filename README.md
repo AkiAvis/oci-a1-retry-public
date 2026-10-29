@@ -20,7 +20,9 @@ OCI Resource Manager の A1 Apply を、確認できた失敗分類に限定し�
 - **KNOWN UNSOLVED — core の任意の unstructured INFO/WARN の意味:** `InvalidParameter` のような INFO、`Account is disabled` / `Access revoked`、未知 notice、payload 内の opaque INFO、arbitrary JSON without recognized `level`/`message` error keys、partial provider fragment、generic timeout、malformed/alternate rendering など、上記の bounded guard が認識しない文字列は、harmless prelude と serious failure を常に区別できません。容量 marker があれば core → small-01 に進む可能性が残ります。これは fail-closed の保証ではありません。別の active-job、history/state/log、inventory、duplicate-target、unknown-target、429 defer の共有ガードは独立して維持しています。
 - history は `TIMECREATED DESC` の必要な範囲だけを厳格に検査します。small の最新から連続する timeout を OCI の既存履歴で数え、3件目で停止します。small の途中で正常な容量不足履歴に到達したらそこで境界を切り、境界より古い PLAN などは検査しません。未知 lifecycle、非 APPLY、取消、履歴/state/log の取得不良は fail closed です。未知の state は診断出力では `UNKNOWN` にクランプします。
 - target label、state、safe job identifier だけを診断に出し、CLI の生エラーやログ本文は出しません。既存の inventory、active-job、重複、未知インスタンス、成功済みだが対象不在、429 defer の安全基準は維持します。
-- 認識済み resource syntax の中にある Terraform payload は、timestamp wrapper の有無にかかわらず、属性・nested block・closing brace の構文だけを small の分類継続として扱います。属性値や resource 名が変わっても継続できますが、その内容が意味的に正常かを universal に判定するものではありません。実 OCI CLI のログ形式と、本番での動作も未確認です。
+- `get-job-logs-content --output json --query data --raw-output` の実観測 CLI 3.95.1 形式 `YYYY/MM/DD HH:MM:SS[TERRAFORM_CONSOLE] [INFO|WARN|ERROR] message` は、source と既知 severity が完全一致する行だけを既存の timestamp/level 分類へ正規化します。未知 source/severity や不正 wrapper は正規化せず、小側の strict classifier では停止します。完全な core 208行・small 54行の実ログをこの renderer で変換した private replay と、従来の downloaded/Console replay を分けてテストします。production pinned CLI 3.89.1 が同じ形式を出すことは未確認です。
+- **本番反映保留:** small 側のログ形式変換で使用する `awk` が、途中までの出力を返して異常終了しても、その終了状態が検査されません。独立した模擬テストでは、変換処理が未知のエラーを含むログを途中まで出力して終了コード1を返した場合でも、後続の small 作成に進みました。これは模擬故障であり、実際に本番で発生したという観測ではありません。変換の失敗を安全側で止める修正と検証が必要です。
+- core の任意の unstructured INFO/WARN の意味は依然として **KNOWN UNSOLVED** です。正規化は形式互換性の修正であり、unknown INFO/WARN fail-open リスクを解消しません。
 
 ## オフライン TDD 検証
 
