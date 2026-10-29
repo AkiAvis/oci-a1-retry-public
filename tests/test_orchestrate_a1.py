@@ -1541,6 +1541,85 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 self.assertNotEqual(fresh_result.returncode, 0)
                 self.assertEqual([call[4] for call in self.create_calls(fresh_calls)], ["stack-core"])
 
+    def test_small_log_normalizer_nonzero_status_fails_closed_for_small_history(self):
+        _, small_log = _load_private_downloaded_logs()
+        small_mixed_log = small_log + chr(10) + "2026/08/07 15:26:45[TERRAFORM_CONSOLE] [ERROR] Error: Unknown failure"
+        for status in (1, 2, 126, 127):
+            with self.subTest(status=status), tempfile.TemporaryDirectory(dir=SCRATCH) as awk_dir:
+                awk_path = Path(awk_dir) / "awk"
+                marker_path = Path(awk_dir) / "normalizer-reached"
+                _make_executable(
+                    awk_path,
+                    textwrap.dedent(
+                        f'''#!/usr/bin/bash
+                        if [[ "$*" == *"print raw"* && "$*" == *"TERRAFORM_CONSOLE"* ]]; then
+                          printf hit > "$NORMALIZER_MARKER"
+                          printf '%s' "$NORMALIZER_PARTIAL"
+                          exit {status}
+                        fi
+                        exec /usr/bin/awk "$@"
+                        '''
+                    ),
+                )
+                result, calls = self.run_orchestrator(
+                    inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+                    jobs={
+                        "stack-small-02": [
+                            _job(f"job-small-history-norm-{status}", logs=small_mixed_log)
+                        ]
+                    },
+                    create={
+                        "stack-small-02": {
+                            "id": f"job-small-history-should-not-start-{status}",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        }
+                    },
+                    extra_env={
+                        "PATH": f"{awk_dir}:/usr/bin:/bin",
+                        "NORMALIZER_MARKER": str(marker_path),
+                        "NORMALIZER_PARTIAL": small_log,
+                    },
+                )
+
+                self.assertTrue(marker_path.is_file(), "normalizer fault injection was not reached")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(small_log, result.stdout + result.stderr)
+                self.assertEqual(self.create_calls(calls), [])
+
+                marker_path.unlink()
+                fresh_result, fresh_calls = self.run_orchestrator(
+                    jobs={
+                        "stack-small-01": [
+                            _job(f"job-small-fresh-history-norm-{status}", logs=small_mixed_log)
+                        ]
+                    },
+                    create={
+                        "stack-core": {
+                            "id": f"job-core-fresh-norm-{status}",
+                            "state": "FAILED",
+                            "logs": CAPACITY_LOG,
+                        },
+                        "stack-small-01": {
+                            "id": f"job-small-fresh-should-not-start-{status}",
+                            "state": "SUCCEEDED",
+                            "logs": "",
+                        },
+                    },
+                    extra_env={
+                        "PATH": f"{awk_dir}:/usr/bin:/bin",
+                        "NORMALIZER_MARKER": str(marker_path),
+                        "NORMALIZER_PARTIAL": small_log,
+                    },
+                )
+                self.assertTrue(marker_path.is_file(), "fresh-path normalizer fault injection was not reached")
+                self.assertNotEqual(fresh_result.returncode, 0)
+                self.assertEqual(
+                    [call[4] for call in self.create_calls(fresh_calls)],
+                    ["stack-core"],
+                )
+                self.assertNotIn(small_log, fresh_result.stdout + fresh_result.stderr)
+
     def test_core_safety_parser_nonzero_status_fails_closed_for_history_and_fresh_failure(self):
         core_log, _ = _load_private_downloaded_logs()
         for status in (1, 2, 126, 127):

@@ -353,11 +353,11 @@ core_mixed_serious_error_present() {
 }
 
 classify_failure_records() {
-  local logs="$1"
+  local logs="$1" normalized_logs
   # OCI CLI 3.95.1 renders selected raw log rows as timestamp[source] [LEVEL] text.
   # Normalize only the observed source and known levels; malformed wrappers remain
   # untouched so the classifier rejects them rather than dropping metadata.
-  logs="$(awk '
+  if ! normalized_logs="$(awk '
     {
       raw = $0
       if (raw ~ /^[0-9][0-9][0-9][0-9][/][0-9][0-9][/][0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\[TERRAFORM_CONSOLE\][[:space:]]+\[(INFO|WARN|ERROR)\][[:space:]]/) {
@@ -366,7 +366,10 @@ classify_failure_records() {
       }
       print raw
     }
-  ' <<<"$logs")"
+  ' <<<"$logs" 2>/dev/null)"; then
+    return 1
+  fi
+  logs="$normalized_logs"
   awk '
     BEGIN {
       seen_blocks = 0
