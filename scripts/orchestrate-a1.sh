@@ -919,11 +919,11 @@ provider_timeout_history_allows() {
   return 0
 }
 
-# Core keeps marker-based capacity recognition, with one bounded additional
-# guard for explicit serious records mixed into that capacity log. Arbitrary
-# INFO/WARN text remains outside this guard and is documented as ambiguous.
+# Core requires the complete bounded capacity-log grammar. Unknown records in
+# prelude, diagnostics, or Terraform payload stop rather than being treated as
+# harmless based on a capacity marker alone.
 core_capacity_history_allows() {
-  local label="$1" expected_state="$2" latest="$3" logs parser_rc
+  local label="$1" expected_state="$2" latest="$3" logs parser_rc classification
 
   logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$latest" --output json --query data --raw-output 2>&1)" || stop_for_failure "$label" "$expected_state" "$latest" log_unavailable
   grep -Fqi 'Out of host capacity' <<<"$logs" || stop_for_failure "$label" "$expected_state" "$latest" unknown
@@ -936,6 +936,8 @@ core_capacity_history_allows() {
     1) ;;
     *) stop_for_failure "$label" "$expected_state" "$latest" core_safety_parser_failed ;;
   esac
+  classification="$(classify_failure_records "$logs")" || stop_for_failure "$label" "$expected_state" "$latest" unknown
+  [[ "$classification" == capacity ]] || stop_for_failure "$label" "$expected_state" "$latest" unknown
   echo "Observed $label Apply history: diagnostic=capacity state=$expected_state job=$(safe_job_id "$latest")." >&2
   return 0
 }
@@ -1059,7 +1061,7 @@ wait_for_terminal() {
 }
 
 failure_is_capacity() {
-  local job_id="$1" logs parser_rc
+  local job_id="$1" logs parser_rc classification
   logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" --output json --query data --raw-output 2>&1)" || fail "Could not read failed-job logs."
   grep -Fqi 'Out of host capacity' <<<"$logs" || return 1
   if core_mixed_serious_error_present "$logs"; then
@@ -1068,9 +1070,12 @@ failure_is_capacity() {
     parser_rc=$?
   fi
   case "$parser_rc" in
-    1) return 0 ;;
+    1) ;;
     *) return 1 ;;
   esac
+  classification="$(classify_failure_records "$logs")" || return 1
+  [[ "$classification" == capacity ]] || return 1
+  return 0
 }
 
 for stack_id in "$OCI_CORE_STACK_ID" "$OCI_SMALL_01_STACK_ID" "$OCI_SMALL_02_STACK_ID"; do

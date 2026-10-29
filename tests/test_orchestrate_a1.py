@@ -456,8 +456,10 @@ def _fake_awk_script(stdout: str = "", stderr: str = "", status: int = 0) -> str
     return newline.join(
         [
             "#!/usr/bin/bash",
-            "/usr/bin/python3 - <<'PY'",
-            "import sys",
+            "/usr/bin/python3 - \"$@\" <<'PY'",
+            "import os, sys",
+            "if not any('pending_level' in arg for arg in sys.argv[1:]):",
+            "    os.execv('/usr/bin/awk', ['/usr/bin/awk', *sys.argv[1:]])",
             f"sys.stdout.write({json.dumps(stdout)})",
             f"sys.stderr.write({json.dumps(stderr)})",
             "PY",
@@ -876,10 +878,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
     def test_known_unsolved_core_baseline_bypass_capacity_and_generic_timeout(self):
@@ -898,10 +900,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
     def test_capacity_failure_still_allows_retry(self):
@@ -916,11 +918,11 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
     def test_core_explicit_preludes_stop_only_for_bounded_serious_markers(self):
         preludes = (
             ("2026/10/26 17:09:35\tINFO\tCredentials rejected", True),
-            ("2026/10/26 17:09:35\tINFO\tAccount is disabled", False),
-            ("2026/10/26 17:09:35\tINFO\tAccess revoked", False),
+            ("2026/10/26 17:09:35\tINFO\tAccount is disabled", True),
+            ("2026/10/26 17:09:35\tINFO\tAccess revoked", True),
             ("2026/10/26 17:09:35\tINFO\t  cReDeNtIaLs\t ReJeCtEd  ", True),
-            ("2026/10/26 17:09:35\tINFO\t ACCOUNT   IS\tDISABLED ", False),
-            ("2026/10/26 17:09:35\tINFO\t aCcEsS\t ReVoKeD ", False),
+            ("2026/10/26 17:09:35\tINFO\t ACCOUNT   IS\tDISABLED ", True),
+            ("2026/10/26 17:09:35\tINFO\t aCcEsS\t ReVoKeD ", True),
             ("Error: AccountSuspended", True),
             ("ERROR: AccountSuspended", True),
             ("error: AccountSuspended", True),
@@ -1101,11 +1103,12 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                                 ["stack-core"],
                             )
 
-    def test_core_bounded_guard_stops_explicit_errors_but_keeps_unknown_info_unsolved(self):
+    def test_arbitrary_unknown_info_and_warn_stop_after_capacity_marker(self):
         suffixes = (
             ("Error: Unexpected provider failure", True),
             (_bracket_row("2026/10/28 10:00:04", "ERROR", "Unexpected provider failure"), True),
-            (_bracket_row("2026/10/28 10:00:04", "INFO", "Unexpected provider failure"), False),
+            (_bracket_row("2026/10/28 10:00:04", "INFO", "Unexpected provider failure"), True),
+            (_bracket_row("2026/10/28 10:00:04", "WARN", "Unfamiliar notice"), True),
         )
         for suffix, should_stop in suffixes:
             with self.subTest(suffix=suffix):
@@ -1163,10 +1166,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     [call[4] for call in self.create_calls(calls)],
-                    ["stack-core", "stack-small-01"],
+                    ["stack-core"],
                 )
 
     def test_known_terraform_capacity_diagnostics_remain_accepted(self):
@@ -1343,10 +1346,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     )
 
                 if block_name == "core":
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(
                         [call[4] for call in self.create_calls(calls)],
-                        ["stack-core", "stack-small-01"],
+                        ["stack-core"],
                     )
                 else:
                     self.assertNotEqual(result.returncode, 0)
@@ -1370,13 +1373,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 },
             }
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
-    def test_actual_full_logs_benign_core_warn_preserves_core_then_small_and_replays_baseline_core_path(self):
+    def test_actual_full_logs_unknown_core_warn_stops_candidate_but_baseline_still_fallbacks(self):
         core_log, small_log = _load_private_downloaded_logs()
         warned_core_log = _insert_before_first_message(
             core_log,
@@ -1403,10 +1406,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             },
         )
 
-        self.assertEqual(candidate_result.returncode, 0, candidate_result.stderr)
+        self.assertNotEqual(candidate_result.returncode, 0, candidate_result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(candidate_calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
         baseline_result, baseline_calls = self.run_orchestrator(
@@ -1510,6 +1513,38 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                         [call[4] for call in self.create_calls(fresh_calls)],
                         ["stack-core"],
                     )
+
+    def test_unknown_core_info_warn_and_payload_stop_on_history_and_fresh_paths(self):
+        core_log, _ = _load_private_downloaded_logs()
+        lines = core_log.splitlines()
+        resource_index = next(index for index, line in enumerate(lines) if "+ resource " in line)
+        capacity_index = next(index for index, line in enumerate(lines) if "Out of host capacity" in line)
+        cases = (
+            ("pre-capacity-info", _bracket_row("2026/10/28 04:09:38", "INFO", "Unfamiliar notice"), 0),
+            ("post-capacity-warn", _bracket_row("2026/10/28 04:09:38", "WARN", "Unknown provider notice"), capacity_index + 1),
+            ("resource-payload-info", _bracket_row("2026/10/28 04:09:38", "INFO", "Opaque unexpected INFO row"), resource_index + 1),
+        )
+        for label, marker, index in cases:
+            with self.subTest(label=label):
+                mixed_log = "\n".join(lines[:index] + [marker] + lines[index:])
+                historical_result, historical_calls = self.run_orchestrator(
+                    jobs={"stack-core": [_job(f"job-{label}-history", logs=mixed_log)]},
+                    create={
+                        "stack-core": {"id": "job-history-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                        "stack-small-01": {"id": "job-small-history-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                    },
+                )
+                self.assertNotEqual(historical_result.returncode, 0)
+                self.assertEqual(self.create_calls(historical_calls), [])
+
+                fresh_result, fresh_calls = self.run_orchestrator(
+                    create={
+                        "stack-core": {"id": f"job-{label}-fresh", "state": "FAILED", "logs": mixed_log},
+                        "stack-small-01": {"id": "job-small-fresh-must-not-start", "state": "SUCCEEDED", "logs": ""},
+                    }
+                )
+                self.assertNotEqual(fresh_result.returncode, 0)
+                self.assertEqual([call[4] for call in self.create_calls(fresh_calls)], ["stack-core"])
 
     def test_observed_cli_wrapped_core_errors_block_history_and_fresh_fallback(self):
         core_log, _ = _load_private_downloaded_logs()
@@ -1752,7 +1787,6 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
     def test_core_safety_parser_clean_and_serious_tokens_preserve_expected_paths(self):
         core_log, _ = _load_private_downloaded_logs()
         for token, expected_history_creates, expected_fresh_creates, expected_history_stderr in (
-            ("clean", ["stack-core"], ["stack-core", "stack-small-01"], None),
             ("serious", [], ["stack-core"], "mixed_serious_error"),
         ):
             with self.subTest(token=token), tempfile.TemporaryDirectory(dir=SCRATCH) as awk_dir:
@@ -1878,10 +1912,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
     def test_variable_plan_prelude_routes_core_then_small01(self):
@@ -1946,10 +1980,10 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                             },
                         }
                     )
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(
                         [call[4] for call in self.create_calls(calls)],
-                        ["stack-core", "stack-small-01"],
+                        ["stack-core"],
                     )
 
     def test_structurally_unknown_small_console_pre_error_records_stop_before_small01_retry(self):
@@ -2460,13 +2494,13 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
             }
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
-            ["stack-core", "stack-small-01"],
+            ["stack-core"],
         )
 
-    def test_core_unknown_info_remains_unsolved_except_explicit_account_marker(self):
+    def test_unknown_info_and_warn_stop_after_capacity_marker(self):
         for unknown_diagnostic in UNKNOWN_INFO_DIAGNOSTICS:
             with self.subTest(unknown_diagnostic=unknown_diagnostic):
                 mixed_log = "\n".join(
@@ -2490,16 +2524,11 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                if unknown_diagnostic == "AccountSuspended":
-                    self.assertNotEqual(result.returncode, 0, result.stderr)
-                    expected_creates = ["stack-core"]
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    expected_creates = ["stack-core", "stack-small-01"]
+                self.assertNotEqual(result.returncode, 0, result.stderr)
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], expected_creates)
+                self.assertEqual([call[4] for call in creates], ["stack-core"])
 
-    def test_core_unkeyed_info_remains_unsolved_except_credentials_rejected(self):
+    def test_core_unkeyed_info_and_warning_stop(self):
         for unknown_diagnostic in UNKEYWORDED_INFO_DIAGNOSTICS:
             with self.subTest(unknown_diagnostic=unknown_diagnostic):
                 mixed_log = "\n".join(
@@ -2523,14 +2552,9 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                     }
                 )
 
-                if unknown_diagnostic == "Credentials rejected":
-                    self.assertNotEqual(result.returncode, 0, result.stderr)
-                    expected_creates = ["stack-core"]
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    expected_creates = ["stack-core", "stack-small-01"]
+                self.assertNotEqual(result.returncode, 0, result.stderr)
                 creates = self.create_calls(calls)
-                self.assertEqual([call[4] for call in creates], expected_creates)
+                self.assertEqual([call[4] for call in creates], ["stack-core"])
 
     def test_provider_timeout_followed_by_structured_error_stops(self):
         mixed_log = "\n".join(
