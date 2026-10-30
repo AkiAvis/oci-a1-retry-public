@@ -197,8 +197,8 @@ VARIABLE_PRELUDE_CAPACITY_LOG = "\n".join(
         "2026/10/26 17:09:33\tINFO\tTerraform will perform the following actions:",
         "2026/10/26 17:09:33\tINFO\t  # module.synthetic.oci_core_instance.generated will be created",
         '2026/10/26 17:09:33\tINFO\t  + resource "oci_core_instance" "generated_alt" {',
-        '      + arbitrary_plan_field = "opaque-but-embedded"',
-        '      + opaque_plan_field = "opaque-but-embedded"',
+        '      + display_name = "opaque-but-embedded"',
+        '      + desired_state = "opaque-but-embedded"',
         '      + availability_domain = "synthetic-ad-2"',
         "    }",
         "2026/10/26 17:09:33\tINFO\tPlan: 1 to add, 0 to change, 0 to destroy.",
@@ -499,6 +499,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         log_outputs=None,
         state_failures=None,
         state_overrides=None,
+        job_list_outputs=None,
         extra_env=None,
         script_text=None,
     ):
@@ -512,6 +513,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         log_outputs = log_outputs or {}
         state_failures = state_failures or {}
         state_overrides = state_overrides or {}
+        job_list_outputs = job_list_outputs or {}
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp_dir:
             temp = Path(temp_dir)
@@ -531,6 +533,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
                         "log_outputs": log_outputs,
                         "state_failures": state_failures,
                         "state_overrides": state_overrides,
+                        "job_list_outputs": job_list_outputs,
                     }
                 )
             )
@@ -567,6 +570,9 @@ class OrchestrateA1TestCase(unittest.TestCase):
 
                     if args[:3] == ["resource-manager", "job", "list"]:
                         stack_id = option("--stack-id")
+                        if stack_id in config["job_list_outputs"] and "--all" in args:
+                            print(config["job_list_outputs"][stack_id], end="")
+                            raise SystemExit(0)
                         jobs = config["jobs"].get(stack_id, [])
                         if "--sort-by" in args:
                             if config["history_failures"].get(stack_id):
@@ -1377,6 +1383,44 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertEqual(
             [call[4] for call in self.create_calls(calls)],
             ["stack-core"],
+        )
+
+    def test_unknown_attribute_shaped_core_notification_stops_fallback(self):
+        core_log, _small_log = _load_private_downloaded_logs()
+        resource_line = next(
+            line for line in core_log.splitlines() if '+ resource "oci_core_instance"' in line
+        )
+        injected = core_log.replace(
+            resource_line,
+            resource_line + '\n' + _bracket_row(
+                "2026/10/28 04:09:38", "INFO", '    + hypothetical_status = "Account suspended"'
+            ),
+            1,
+        )
+        result, calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-unknown-attribute-history", logs=injected)],
+                "stack-small-01": [_job("job-unknown-attribute-small-history", logs=SMALL01_CONSOLE_LOG)],
+            },
+            create={
+                "stack-core": {"id": "job-unknown-attribute-core", "state": "FAILED", "logs": core_log},
+                "stack-small-01": {"id": "job-unknown-attribute-small01", "state": "SUCCEEDED", "logs": ""},
+            }
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.create_calls(calls), [])
+
+        baseline_result, baseline_calls = self.run_orchestrator(
+            create={
+                "stack-core": {"id": "job-unknown-attribute-core", "state": "FAILED", "logs": injected},
+                "stack-small-01": {"id": "job-unknown-attribute-small01", "state": "SUCCEEDED", "logs": ""},
+            },
+            script_text=_baseline_script_text(),
+        )
+        self.assertEqual(baseline_result.returncode, 0, baseline_result.stderr)
+        self.assertEqual(
+            [call[4] for call in self.create_calls(baseline_calls)],
+            ["stack-core", "stack-small-01"],
         )
 
     def test_actual_full_logs_unknown_core_warn_stops_candidate_but_baseline_still_fallbacks(self):
@@ -2727,12 +2771,12 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
                 _bracket_row(
                     "2026/10/28 04:09:38",
                     "INFO",
-                    '      + message = "Error: InvalidParameter"',
+                    '      + display_name = "Error: InvalidParameter"',
                 ),
                 _bracket_row(
                     "2026/10/28 04:09:38",
                     "INFO",
-                    '      + status = "ERROR"',
+                    '      + desired_state = "ERROR"',
                 ),
                 _bracket_row("2026/10/28 04:09:38", "INFO", "    }"),
             ]
@@ -2794,7 +2838,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Could not parse Resource Manager jobs", result.stderr)
+        self.assertIn("Resource Manager job list", result.stderr)
         self.assertFalse(self.create_calls(calls))
 
     def test_capacity_history_resets_timeout_streak(self):
@@ -3103,7 +3147,7 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Could not parse Resource Manager jobs", result.stderr)
+        self.assertIn("Resource Manager job list", result.stderr)
         self.assertFalse(self.create_calls(calls))
 
     def test_unknown_job_state_is_clamped_to_unknown_in_diagnostics(self):

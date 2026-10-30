@@ -41,30 +41,29 @@ job_state() {
 }
 
 has_active_job() {
-  local stack_id="$1" jobs rc
+  local stack_id="$1" jobs active_count
   jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json 2>&1)" || fail "Could not list Resource Manager jobs."
-  if ! jq -e '
-    (.data | type == "array") and
-    all(.data[];
-      type == "object" and
-      (.["id"] | type == "string" and length > 0) and
-      (.["lifecycle-state"] | type == "string" and (
-        . == "ACCEPTED" or . == "IN_PROGRESS" or . == "CANCELING" or
-        . == "SUCCEEDED" or . == "FAILED" or . == "CANCELED"
-      ))
-    )
-  ' >/dev/null 2>/dev/null <<<"$jobs"; then
-    fail "Could not parse Resource Manager jobs."
-  fi
-  if jq -e 'any(.data[]; .["lifecycle-state"] == "ACCEPTED" or .["lifecycle-state"] == "IN_PROGRESS" or .["lifecycle-state"] == "CANCELING")' >/dev/null 2>/dev/null <<<"$jobs"; then
-    return 0
-  else
-    rc=$?
-  fi
-  case "$rc" in
-    1) return 1 ;;
-    *) fail "Could not parse Resource Manager jobs." ;;
-  esac
+  active_count="$(jq -er -s '
+    if length != 1 then error("expected one JSON document")
+    else
+      .[0] as $document |
+      if ($document | type) == "object" and
+         ($document.data | type) == "array" and
+         all($document.data[];
+           type == "object" and
+           (.["id"] | type == "string" and length > 0) and
+           (.["lifecycle-state"] | type == "string" and (
+             . == "ACCEPTED" or . == "IN_PROGRESS" or . == "CANCELING" or
+             . == "SUCCEEDED" or . == "FAILED" or . == "CANCELED"
+           ))
+         )
+      then [$document.data[] | select(.["lifecycle-state"] == "ACCEPTED" or .["lifecycle-state"] == "IN_PROGRESS" or .["lifecycle-state"] == "CANCELING")] | length
+      else error("invalid job list")
+      end
+    end
+  ' 2>/dev/null <<<"$jobs")" || fail "Could not validate Resource Manager job list."
+  [[ "$active_count" =~ ^[0-9]+$ ]] || fail "Could not validate Resource Manager job list."
+  (( active_count > 0 ))
 }
 
 ordered_job_history() {
@@ -544,10 +543,25 @@ classify_failure_records() {
       return 0
     }
 
+    function known_terraform_attribute(message, key, count, names, i) {
+      if (message !~ /^[+~-][[:space:]]+("[A-Za-z_][A-Za-z0-9_]*"|[A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=/) return 0
+      key = message
+      sub(/^[+~-][[:space:]]+/, "", key)
+      if (key ~ /^"/) {
+        sub(/^"/, "", key)
+        sub(/".*$/, "", key)
+      } else {
+        sub(/[[:space:]]*=.*$/, "", key)
+      }
+      count = split("are_all_plugins_disabled are_legacy_imds_endpoints_disabled assign_ipv6ip assign_private_dns_record assign_public_ip availability_domain baseline_ocpu_utilization boot_volume_id boot_volume_size_in_gbs boot_volume_vpus_per_gb capacity_reservation_id compartment_id compute_cluster_id dedicated_vm_host_id defined_tags desired_state display_name extended_metadata fault_domain freeform_tags gpu_description gpus hostname_label id image instance_configuration_id ipxe_script is_ai_enterprise_enabled is_cross_numa_node is_live_migration_preferred is_management_disabled is_monitoring_disabled is_pv_encryption_in_transit_enabled launch_mode local_disk_description local_disks local_disks_total_size_in_gbs local_volume_size_in_gbs max_vnic_attachments memory_in_gbs metadata name networking_bandwidth_in_gbps nsg_ids nvmes ocpus platform private_ip private_ip_id processor_description public_ip recovery_action region resource_management security_attributes ssh_authorized_keys security_attributes_state shape skip_source_dest_check source_id source_type state subnet_cidr subnet_id system_tags time_created time_maintenance_reboot_due vcpus vlan_id", names, " ")
+      for (i = 1; i <= count; i++) if (key == names[i]) return 1
+      return 0
+    }
+
     function terraform_payload_record_is_safe(message) {
       if (message == "}" ||
           message ~ /^[+~-][[:space:]]+[A-Za-z0-9_.-]+([[:space:]]+"[^"]+")*[[:space:]]*\{[[:space:]]*$/ ||
-          message ~ /^[+~-][[:space:]]+("[^"]+"|[A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*.*$/) {
+          (known_terraform_attribute(message) && message ~ /^[+~-][[:space:]]+("[^"]+"|[A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*.*$/)) {
         return 1
       }
       return 0
@@ -848,13 +862,15 @@ failure_classification() {
 }
 
 mask_job_id() {
-  if [[ "${GITHUB_ACTIONS:-}" == true && -n "$1" ]]; then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" && -n "$1" ]]; then
     printf '::add-mask::%s\n' "$1"
   fi
 }
 
 safe_job_id() {
-  if [[ "$1" =~ ^(job|test)-[A-Za-z0-9._-]+$ ]]; then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '%s' 'redacted-job-id'
+  elif [[ "$1" =~ ^(job|test)-[A-Za-z0-9._-]+$ ]]; then
     printf '%s\n' "$1"
   else
     printf '%s\n' redacted-job-id
@@ -1095,7 +1111,7 @@ for stack_id in "$OCI_CORE_STACK_ID" "$OCI_SMALL_01_STACK_ID" "$OCI_SMALL_02_STA
 done
 
 instances="$("$PYTHON_BIN" "$INSTANCE_LIST_SCRIPT" "$OCI_A1_COMPARTMENT_ID")" || fail "Could not list Compute instances; refusing to treat this as zero instances."
-jq -e '.data | type == "array"' >/dev/null <<<"$instances" || fail "Compute instance list did not return an array."
+jq -e '.data | type == "array"' >/dev/null 2>/dev/null <<<"$instances" || fail "Compute instance list did not return an array."
 
 classification="$(jq -c \
   --arg core "$CORE_NAME" \
@@ -1112,7 +1128,7 @@ classification="$(jq -c \
     total: $a1
   } |
   . + {expected: (.core + .small01 + .small02 | length)}
-' <<<"$instances")" || fail "Could not classify A1 instances."
+' 2>/dev/null <<<"$instances")" || fail "Could not classify A1 instances."
 
 total="$(jq -r '.total | length' <<<"$classification")"
 expected="$(jq -r '.expected' <<<"$classification")"
