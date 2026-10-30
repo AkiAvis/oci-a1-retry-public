@@ -847,6 +847,12 @@ failure_classification() {
   return 1
 }
 
+mask_job_id() {
+  if [[ "${GITHUB_ACTIONS:-}" == true && -n "$1" ]]; then
+    printf '::add-mask::%s\n' "$1"
+  fi
+}
+
 safe_job_id() {
   if [[ "$1" =~ ^(job|test)-[A-Za-z0-9._-]+$ ]]; then
     printf '%s\n' "$1"
@@ -876,6 +882,7 @@ provider_timeout_history_allows() {
     history_entry_is_safe <<<"$entry" || stop_for_failure "$label" "$expected_state" "$latest" history_invalid
 
     id="$(jq -r '.id' <<<"$entry")" || stop_for_failure "$label" "$expected_state" "$latest" history_malformed
+    mask_job_id "$id"
     listed_state="$(jq -r '."lifecycle-state"' <<<"$entry")" || stop_for_failure "$label" "$expected_state" "$latest" history_malformed
 
     if (( first == 1 )); then
@@ -958,6 +965,7 @@ ensure_retry_allowed() {
   history_entry_is_safe <<<"$latest_entry" || stop_for_failure "$label" UNKNOWN "" history_invalid
 
   latest="$(jq -r '.id' <<<"$latest_entry")" || stop_for_failure "$label" UNKNOWN "" history_malformed
+  mask_job_id "$latest"
   state="$(job_state "$latest")" || stop_for_failure "$label" UNKNOWN "$latest" state_unavailable
   history_state="$(jq -r '."lifecycle-state"' <<<"$latest_entry")" || stop_for_failure "$label" "$state" "$latest" history_malformed
   [[ "$state" == "$history_state" ]] || stop_for_failure "$label" "$state" "$latest" history_state_mismatch
@@ -1000,6 +1008,7 @@ create_apply_job() {
         echo "Apply job response did not include an ID." >&2
         return 1
       fi
+      mask_job_id "$job_id"
       CREATED_JOB_ID="$job_id"
       return 0
     fi

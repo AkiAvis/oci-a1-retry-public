@@ -1,5 +1,11 @@
 # OCI A1 bounded recovery
 
+## Resource ID log privacy
+
+Configured OCI stack and compartment IDs are read from GitHub Actions secrets, not plain repository variables. Configure all four named secrets before activating this change; missing values stop the workflow rather than falling back to unmasked variables. The first workflow step uses the documented GitHub Actions `::add-mask::` workflow command and then exports the values through `GITHUB_ENV` for later workflow steps. The orchestrator similarly masks each historical or newly created Resource Manager job ID before subsequent diagnostics or commands can print it. OCI job IDs are not included in the orchestrator's own normal production diagnostics unless they match the explicit fake-test identifier format; other IDs are represented by a fixed placeholder.
+
+This is an offline source-and-fake validation only. It does not establish live runner log presentation/behavior, nor can it prove that a third-party action or an OCI CLI error string will never include an identifier before masking. No workflow was dispatched.
+
 OCI Resource Manager の A1 Apply を、確認できた失敗分類に限定して次回の定期実行で再試行する仕組みです。実際の定期実行では OCI と GitHub に接続し、条件を満たす場合は Apply を開始します。
 
 ## 修正した安全境界
