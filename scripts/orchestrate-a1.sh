@@ -18,6 +18,18 @@ SMALL_01_NAME="${SMALL_01_NAME:-hermes-a1-small-01}"
 SMALL_02_NAME="${SMALL_02_NAME:-hermes-a1-small-02}"
 CREATED_JOB_ID=""
 
+mask_job_id() {
+  [[ -n "$1" ]] && printf '::add-mask::%s\n' "$1"
+}
+
+safe_job_id() {
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '%s' 'redacted-job-id'
+  else
+    printf '%s' "$1"
+  fi
+}
+
 fail() {
   echo "ERROR: $*" >&2
   exit 1
@@ -27,25 +39,36 @@ fail() {
 [[ "$CREATE_JOB_BACKOFF_SECONDS" =~ ^[1-9][0-9]*$ ]] || fail "CREATE_JOB_BACKOFF_SECONDS must be a positive integer."
 
 job_state() {
-  "$OCI_BIN" resource-manager job get --job-id "$1" --query 'data."lifecycle-state"' --raw-output
+  "$OCI_BIN" resource-manager job get --job-id "$1" --query 'data."lifecycle-state"' --raw-output 2>/dev/null
 }
 
 has_active_job() {
-  local stack_id="$1" jobs
-  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json)" || fail "Could not list Resource Manager jobs."
-  jq -e '.data[]? | select(."lifecycle-state" == "ACCEPTED" or ."lifecycle-state" == "IN_PROGRESS" or ."lifecycle-state" == "CANCELING")' >/dev/null <<<"$jobs"
+  local stack_id="$1" jobs active_count
+  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json 2>/dev/null)" || fail "Could not list Resource Manager jobs."
+  jq -e '
+    .data | type == "array" and all(.[];
+      type == "object" and
+      ( ."lifecycle-state" as $state |
+        ($state | type == "string") and
+        (["ACCEPTED", "IN_PROGRESS", "CANCELING", "SUCCEEDED", "FAILED", "CANCELED"] | index($state) != null)
+      )
+    )
+  ' >/dev/null 2>&1 <<<"$jobs" || fail "Could not validate Resource Manager job list."
+  active_count="$(jq -r '[.data[] | select(."lifecycle-state" == "ACCEPTED" or ."lifecycle-state" == "IN_PROGRESS" or ."lifecycle-state" == "CANCELING")] | length' 2>/dev/null <<<"$jobs")" || fail "Could not parse Resource Manager job list."
+  (( active_count > 0 ))
 }
 
 latest_job_id() {
   local stack_id="$1" jobs
-  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --sort-by TIMECREATED --sort-order DESC --limit 1 --output json)" || fail "Could not read the latest Resource Manager job."
-  jq -r '.data[0].id // empty' <<<"$jobs"
+  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --sort-by TIMECREATED --sort-order DESC --limit 1 --output json 2>/dev/null)" || fail "Could not read the latest Resource Manager job."
+  jq -r '.data[0].id // empty' 2>/dev/null <<<"$jobs" || fail "Could not parse the latest Resource Manager job."
 }
 
 ensure_retry_allowed() {
   local stack_id="$1" latest state logs
   latest="$(latest_job_id "$stack_id")"
   [[ -z "$latest" ]] && return 0
+  mask_job_id "$latest"
   state="$(job_state "$latest")" || fail "Could not read the latest Resource Manager job state."
   case "$state" in
     FAILED)
@@ -59,7 +82,7 @@ ensure_retry_allowed() {
       fail "A Resource Manager job is active; refusing another Apply."
       ;;
     *)
-      fail "Unexpected latest job state: $state"
+      fail "Unexpected latest job state; retry is stopped."
       ;;
   esac
 }
@@ -71,7 +94,7 @@ create_apply_job() {
 
   for ((attempt = 1; attempt <= CREATE_JOB_MAX_ATTEMPTS; attempt++)); do
     if response="$("$OCI_BIN" resource-manager job create-apply-job --stack-id "$stack_id" --execution-plan-strategy AUTO_APPROVED --output json 2>&1)"; then
-      job_id="$(jq -r '.data.id // empty' <<<"$response")" || {
+      job_id="$(jq -r '.data.id // empty' 2>/dev/null <<<"$response")" || {
         echo "Could not parse Apply job response." >&2
         return 1
       }
@@ -79,6 +102,7 @@ create_apply_job() {
         echo "Apply job response did not include an ID." >&2
         return 1
       fi
+      mask_job_id "$job_id"
       CREATED_JOB_ID="$job_id"
       return 0
     fi
@@ -95,7 +119,7 @@ create_apply_job() {
       continue
     fi
 
-    echo "$response" >&2
+    echo "OCI Resource Manager failed to create an Apply job." >&2
     return 1
   done
 
@@ -132,7 +156,7 @@ wait_for_terminal() {
         sleep "$POLL_SECONDS"
         ;;
       *)
-        fail "Unexpected Apply job state while waiting: $state"
+        fail "Unexpected Apply job state while waiting."
         ;;
     esac
   done
@@ -153,7 +177,7 @@ for stack_id in "$OCI_CORE_STACK_ID" "$OCI_SMALL_01_STACK_ID" "$OCI_SMALL_02_STA
 done
 
 instances="$("$PYTHON_BIN" "$INSTANCE_LIST_SCRIPT" "$OCI_A1_COMPARTMENT_ID")" || fail "Could not list Compute instances; refusing to treat this as zero instances."
-jq -e '.data | type == "array"' >/dev/null <<<"$instances" || fail "Compute instance list did not return an array."
+jq -e '.data | type == "array"' >/dev/null 2>&1 <<<"$instances" || fail "Compute instance list did not return an array."
 
 classification="$(jq -c \
   --arg core "$CORE_NAME" \
@@ -170,15 +194,15 @@ classification="$(jq -c \
     total: $a1
   } |
   . + {expected: (.core + .small01 + .small02 | length)}
-' <<<"$instances")" || fail "Could not classify A1 instances."
+' 2>/dev/null <<<"$instances")" || fail "Could not classify A1 instances."
 
-total="$(jq -r '.total | length' <<<"$classification")"
-expected="$(jq -r '.expected' <<<"$classification")"
+total="$(jq -r '.total | length' 2>/dev/null <<<"$classification")"
+expected="$(jq -r '.expected' 2>/dev/null <<<"$classification")"
 [[ "$total" == "$expected" ]] || fail "Unexpected active A1 instance detected; refusing Apply to avoid paid usage."
 
-core_count="$(jq -r '.core | length' <<<"$classification")"
-small01_count="$(jq -r '.small01 | length' <<<"$classification")"
-small02_count="$(jq -r '.small02 | length' <<<"$classification")"
+core_count="$(jq -r '.core | length' 2>/dev/null <<<"$classification")"
+small01_count="$(jq -r '.small01 | length' 2>/dev/null <<<"$classification")"
+small02_count="$(jq -r '.small02 | length' 2>/dev/null <<<"$classification")"
 [[ "$core_count" -le 1 && "$small01_count" -le 1 && "$small02_count" -le 1 ]] || fail "Duplicate target A1 instances detected; refusing Apply."
 
 if [[ "$core_count" == 1 || $((small01_count + small02_count)) -eq 2 ]]; then
@@ -190,7 +214,7 @@ if [[ "$small01_count" == 1 && "$small02_count" == 0 ]]; then
   ensure_retry_allowed "$OCI_SMALL_02_STACK_ID"
   create_apply_job_or_defer "$OCI_SMALL_02_STACK_ID" "small-02"
   job_id="$CREATED_JOB_ID"
-  echo "Started small-02 Apply job: $job_id"
+  echo "Started small-02 Apply job: $(safe_job_id "$job_id")"
   exit 0
 fi
 
@@ -201,7 +225,7 @@ fi
 ensure_retry_allowed "$OCI_CORE_STACK_ID"
 create_apply_job_or_defer "$OCI_CORE_STACK_ID" "core 2/12"
 core_job_id="$CREATED_JOB_ID"
-echo "Started core 2/12 Apply job: $core_job_id"
+echo "Started core 2/12 Apply job: $(safe_job_id "$core_job_id")"
 core_result="$(wait_for_terminal "$core_job_id")"
 [[ "$core_result" == SUCCEEDED ]] && exit 0
 [[ "$core_result" == FAILED ]] || fail "Core Apply did not succeed: $core_result"
@@ -210,4 +234,4 @@ failure_is_capacity "$core_job_id" || fail "Core Apply failed for a reason other
 ensure_retry_allowed "$OCI_SMALL_01_STACK_ID"
 create_apply_job_or_defer "$OCI_SMALL_01_STACK_ID" "small-01"
 small_job_id="$CREATED_JOB_ID"
-echo "Started small-01 Apply job after core capacity failure: $small_job_id"
+echo "Started small-01 Apply job after core capacity failure: $(safe_job_id "$small_job_id")"

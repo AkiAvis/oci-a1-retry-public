@@ -16,10 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      OCI_CORE_STACK_ID: ${{ vars.OCI_CORE_STACK_ID }}
-      OCI_SMALL_01_STACK_ID: ${{ vars.OCI_SMALL_01_STACK_ID }}
-      OCI_SMALL_02_STACK_ID: ${{ vars.OCI_SMALL_02_STACK_ID }}
-      OCI_A1_COMPARTMENT_ID: ${{ vars.OCI_A1_COMPARTMENT_ID }}
       OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
@@ -28,6 +24,23 @@ jobs:
       CREATE_JOB_MAX_ATTEMPTS: "1"
 
     steps:
+      - name: Mask and export OCI resource IDs
+        shell: bash
+        env:
+          OCI_CORE_STACK_ID: ${{ secrets.OCI_CORE_STACK_ID }}
+          OCI_SMALL_01_STACK_ID: ${{ secrets.OCI_SMALL_01_STACK_ID }}
+          OCI_SMALL_02_STACK_ID: ${{ secrets.OCI_SMALL_02_STACK_ID }}
+          OCI_A1_COMPARTMENT_ID: ${{ secrets.OCI_A1_COMPARTMENT_ID }}
+        run: |
+          set -euo pipefail
+          for name in OCI_CORE_STACK_ID OCI_SMALL_01_STACK_ID OCI_SMALL_02_STACK_ID OCI_A1_COMPARTMENT_ID; do
+            value="${!name:-}"
+            if [[ -n "$value" ]]; then
+              printf '::add-mask::%s\n' "$value"
+            fi
+            printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+          done
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Validate configuration and secrets
