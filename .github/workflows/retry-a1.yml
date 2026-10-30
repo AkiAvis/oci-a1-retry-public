@@ -91,7 +91,7 @@ jobs:
           set -euo pipefail
 
           instances="$(python scripts/list-a1-instances.py "$OCI_A1_COMPARTMENT_ID")"
-          jq -e '.data | type == "array"' >/dev/null <<<"$instances"
+          jq -e '.data | type == "array"' >/dev/null 2>/dev/null <<<"$instances"
 
           classification="$(jq -c \
             --arg core "hermes-core-01" \
@@ -106,18 +106,18 @@ jobs:
               total: $a1
             } |
             . + {expected: (.core + .small01 + .small02 | length)}
-          ' <<<"$instances")"
+          ' 2>/dev/null <<<"$instances")"
 
-          total="$(jq -r '.total | length' <<<"$classification")"
-          expected="$(jq -r '.expected' <<<"$classification")"
+          total="$(jq -r '.total | length' 2>/dev/null <<<"$classification")"
+          expected="$(jq -r '.expected' 2>/dev/null <<<"$classification")"
           if [[ "$total" != "$expected" ]]; then
             echo "Unexpected A1 instance detected; skipping acquisition notification."
             exit 0
           fi
 
-          core_count="$(jq -r '.core | length' <<<"$classification")"
-          small01_count="$(jq -r '.small01 | length' <<<"$classification")"
-          small02_count="$(jq -r '.small02 | length' <<<"$classification")"
+          core_count="$(jq -r '.core | length' 2>/dev/null <<<"$classification")"
+          small01_count="$(jq -r '.small01 | length' 2>/dev/null <<<"$classification")"
+          small02_count="$(jq -r '.small02 | length' 2>/dev/null <<<"$classification")"
 
           if [[ "$core_count" != 1 && ! ( "$small01_count" == 1 && "$small02_count" == 1 ) ]]; then
             echo "Always Free A1 target is not fully satisfied yet; no notification."

@@ -45,16 +45,25 @@ job_state() {
 has_active_job() {
   local stack_id="$1" jobs active_count
   jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json 2>/dev/null)" || fail "Could not list Resource Manager jobs."
-  jq -e '
-    .data | type == "array" and all(.[];
-      type == "object" and
-      ( ."lifecycle-state" as $state |
-        ($state | type == "string") and
-        (["ACCEPTED", "IN_PROGRESS", "CANCELING", "SUCCEEDED", "FAILED", "CANCELED"] | index($state) != null)
-      )
-    )
-  ' >/dev/null 2>&1 <<<"$jobs" || fail "Could not validate Resource Manager job list."
-  active_count="$(jq -r '[.data[] | select(."lifecycle-state" == "ACCEPTED" or ."lifecycle-state" == "IN_PROGRESS" or ."lifecycle-state" == "CANCELING")] | length' 2>/dev/null <<<"$jobs")" || fail "Could not parse Resource Manager job list."
+  active_count="$(jq -er -s '
+    if length != 1 then error("expected one JSON document")
+    else
+      .[0] as $document |
+      if ($document | type) == "object" and
+         ($document.data | type) == "array" and
+         all($document.data[];
+           type == "object" and
+           ( ."lifecycle-state" as $state |
+             ($state | type == "string") and
+             (["ACCEPTED", "IN_PROGRESS", "CANCELING", "SUCCEEDED", "FAILED", "CANCELED"] | index($state) != null)
+           )
+         )
+      then [$document.data[] | select(."lifecycle-state" == "ACCEPTED" or ."lifecycle-state" == "IN_PROGRESS" or ."lifecycle-state" == "CANCELING")] | length
+      else error("invalid job list")
+      end
+    end
+  ' 2>/dev/null <<<"$jobs")" || fail "Could not validate Resource Manager job list."
+  [[ "$active_count" =~ ^[0-9]+$ ]] || fail "Could not validate Resource Manager job list."
   (( active_count > 0 ))
 }
 

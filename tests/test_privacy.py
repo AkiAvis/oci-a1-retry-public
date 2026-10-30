@@ -196,6 +196,31 @@ print(os.environ["FAKE_INVENTORY"])
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn(secret, result.stderr)
 
+    def test_notification_jq_errors_are_suppressed(self):
+        workflow = WORKFLOW.read_text()
+        notification = workflow.split("      - name: Notify once when the A1 target is acquired\n", 1)[1]
+        notification_run = notification.split("        run: |\n", 1)[1]
+        self.assertIn("jq -e '.data | type == \"array\"' >/dev/null 2>/dev/null <<<\"$instances\"", notification_run)
+        self.assertIn("' 2>/dev/null <<<\"$instances\")", notification_run)
+        for expression in (".total | length", ".expected", ".core | length", ".small01 | length", ".small02 | length"):
+            self.assertIn(f"jq -r '{expression}' 2>/dev/null <<<\"$classification\"", notification_run)
+
+    def test_job_list_rejects_multiple_or_trailing_json_documents_before_apply(self):
+        active = json.dumps({"data": [{"lifecycle-state": "IN_PROGRESS"}]})
+        empty = json.dumps({"data": []})
+        malformed_streams = (
+            f"{active}\n{empty}",
+            f"{empty}\n{active}",
+            f"{empty}\nnot-json",
+            f"{empty}\n{empty}",
+        )
+        for response in malformed_streams:
+            with self.subTest(response=response):
+                result, trace = self.run_case_with_trace([], FAKE_LIST_RESPONSE=response)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Started ", result.stdout)
+                self.assertNotIn("resource-manager job create-apply-job", trace)
+
     def test_job_list_requires_object_rows_with_known_lifecycle_states(self):
         invalid_lists = (
             {},
