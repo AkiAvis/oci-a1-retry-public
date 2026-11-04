@@ -3310,5 +3310,65 @@ class OrchestrateA1EmptyJobListTests(OrchestrateA1TestCase):
         self.assertIn("Could not list Resource Manager jobs.", result.stderr)
 
 
+class OrchestrateA1ProviderNoticeTests(OrchestrateA1TestCase):
+    """A Terraform provider-update notice must not turn a clear capacity failure into "unknown"."""
+
+    def _capacity_log(self, provider_line):
+        return CAPACITY_LOG.replace("Provider version: 9.11.0", provider_line)
+
+    def test_provider_update_notice_keeps_the_capacity_verdict(self):
+        logs = self._capacity_log(
+            "Provider version: 9.11.0, released on 2026-10-21. "
+            "This provider is 1 Update(s) behind to current."
+        )
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-notice", logs=logs)]}
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][4], "stack-core")
+        self.assertIn("diagnostic=capacity", result.stderr)
+
+    def test_several_pending_updates_keep_the_capacity_verdict(self):
+        logs = self._capacity_log(
+            "Provider version: 9.11.0, released on 2026-10-21. "
+            "This provider is 3 Update(s) behind to current."
+        )
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-notice", logs=logs)]}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.create_calls(calls)), 1)
+        self.assertIn("diagnostic=capacity", result.stderr)
+
+    def test_unrecognised_provider_notice_still_stops(self):
+        logs = self._capacity_log(
+            "Provider version: 9.11.0, released on 2026-10-21. "
+            "This provider is behind schedule."
+        )
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-notice", logs=logs)]}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn("diagnostic=unknown", result.stderr)
+
+    def test_extra_text_after_the_notice_still_stops(self):
+        logs = self._capacity_log(
+            "Provider version: 9.11.0, released on 2026-10-21. "
+            "This provider is 1 Update(s) behind to current. Upgrade advised."
+        )
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-notice", logs=logs)]}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn("diagnostic=unknown", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()

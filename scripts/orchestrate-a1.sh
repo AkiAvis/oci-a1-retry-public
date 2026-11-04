@@ -476,7 +476,7 @@ classify_failure_records() {
       if (message ~ /^Suggestion: The service for this resource encountered an error[.]([[:space:]]+Please contact support for help with service:[[:space:]]+[A-Za-z][A-Za-z0-9 ._-]*[.]?)?$/ ||
           message ~ /^(Documentation|API Reference):[[:space:]]+https:[/][/]((registry[.]terraform[.]io)|(docs[.]oracle[.]com))[/][^[:space:]]+$/ ||
           message ~ /^Request Target:[[:space:]]+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)[[:space:]]+(https:[/][/][^[:space:]]+|<redacted-url>)$/ ||
-          message ~ /^Provider version:[[:space:]]+[0-9]+[.][0-9]+[.][0-9]+(,[[:space:]]+released on[[:space:]]+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2}|[[:alpha:]]+[[:space:]]+[0-9]{1,2},[[:space:]]+[0-9]{4}|<redacted-date>)[.]?)?$/ ||
+          message ~ /^Provider version:[[:space:]]+[0-9]+[.][0-9]+[.][0-9]+(,[[:space:]]+released on[[:space:]]+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2}|[[:alpha:]]+[[:space:]]+[0-9]{1,2},[[:space:]]+[0-9]{4}|<redacted-date>)[.]?)?( This provider is [0-9]+ Update[(]s[)] behind to current[.])?$/ ||
           message == "Service: Core Instance" ||
           message == "Operation Name: LaunchInstance" ||
           message ~ /^OPC[[:space:]]+[Rr]equest ID:[[:space:]]+[^[:space:]]+$/ ||
