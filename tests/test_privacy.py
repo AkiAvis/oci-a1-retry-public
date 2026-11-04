@@ -13,6 +13,13 @@ RESOURCE_IDS = (
     "OCI_SMALL_02_STACK_ID",
     "OCI_A1_COMPARTMENT_ID",
 )
+JOB_LIST_MESSAGES = {
+    "docs": "Could not validate Resource Manager job list: expected exactly one JSON document.",
+    "shape": "Could not validate Resource Manager job list: invalid top-level shape.",
+    "row": "Could not validate Resource Manager job list: malformed job row.",
+    "state": "Could not validate Resource Manager job list: unrecognized lifecycle state.",
+    "parser": "Could not validate Resource Manager job list: parser failure.",
+}
 
 
 class PrivacyWorkflowTests(OrchestrateA1TestCase):
@@ -152,6 +159,71 @@ class PrivacyWorkflowTests(OrchestrateA1TestCase):
                 result, calls = self.run_orchestrator(job_list_outputs={"stack-core": json.dumps(inactive)})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(self.create_calls(calls))
+
+    def test_job_list_stderr_warning_does_not_change_the_successful_run(self):
+        warning = "synthetic benign CLI warning that is not JSON"
+        baseline_result, baseline_calls = self.run_orchestrator()
+        self.assertEqual(baseline_result.returncode, 0, baseline_result.stderr)
+
+        result, calls = self.run_orchestrator(
+            job_list_stderr={
+                "stack-core": warning,
+                "stack-small-01": warning,
+                "stack-small-02": warning,
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, baseline_result.stdout)
+        self.assertEqual(self.create_calls(calls), self.create_calls(baseline_calls))
+        self.assertTrue(self.create_calls(calls))
+        self.assertNotIn(warning, result.stderr)
+
+    def test_job_state_stderr_warning_does_not_change_polling(self):
+        warning = "synthetic benign job-get warning"
+        result, calls = self.run_orchestrator(job_get_stderr={"job-new": warning})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.create_calls(calls))
+        self.assertNotIn(warning, result.stderr)
+
+    def test_job_list_stderr_warning_with_multiple_documents_still_stops(self):
+        warning = "synthetic benign CLI warning that is not JSON"
+        active = json.dumps({"data": [{"id": "synthetic-active-id", "lifecycle-state": "IN_PROGRESS"}]})
+        empty = json.dumps({"data": []})
+        result, calls = self.run_orchestrator(
+            job_list_outputs={"stack-core": f"{active}\n{empty}"},
+            job_list_stderr={"stack-core": warning},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Started ", result.stdout)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn(JOB_LIST_MESSAGES["docs"], result.stderr)
+        self.assertNotIn(warning, result.stderr)
+        self.assertNotIn("synthetic-active-id", result.stderr)
+
+    def test_job_list_validation_uses_distinct_static_category_messages(self):
+        triggers = {
+            "docs": f"{json.dumps({'data': []})}\n{json.dumps({'data': []})}",
+            "shape": json.dumps({}),
+            "row": json.dumps({"data": [{"id": "synthetic-private-row-id", "lifecycle-state": 7}]}),
+            "state": json.dumps(
+                {"data": [{"id": "synthetic-private-state-id", "lifecycle-state": "MYSTERY"}]}
+            ),
+            "parser": "not-json",
+        }
+        seen = set()
+        for category, response in triggers.items():
+            with self.subTest(category=category):
+                result, calls = self.run_orchestrator(job_list_outputs={"stack-core": response})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Started ", result.stdout)
+                self.assertFalse(self.create_calls(calls))
+                self.assertIn(JOB_LIST_MESSAGES[category], result.stderr)
+                self.assertNotIn("synthetic-private-", result.stderr)
+                seen.add(JOB_LIST_MESSAGES[category])
+        self.assertEqual(len(seen), len(JOB_LIST_MESSAGES))
 
 
 if __name__ == "__main__":

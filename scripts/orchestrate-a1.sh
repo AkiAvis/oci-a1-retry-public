@@ -29,7 +29,7 @@ fail() {
 
 job_state() {
   local state
-  state="$("$OCI_BIN" resource-manager job get --job-id "$1" --query 'data."lifecycle-state"' --raw-output 2>&1)" || return 1
+  state="$("$OCI_BIN" resource-manager job get --job-id "$1" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)" || return 1
   case "$state" in
     ACCEPTED|IN_PROGRESS|CANCELING|SUCCEEDED|FAILED|CANCELED)
       printf '%s\n' "$state"
@@ -41,34 +41,53 @@ job_state() {
 }
 
 has_active_job() {
-  local stack_id="$1" jobs active_count
-  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json 2>&1)" || fail "Could not list Resource Manager jobs."
-  active_count="$(jq -er -s '
-    if length != 1 then error("expected one JSON document")
+  local stack_id="$1" jobs token active_count
+  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json 2>/dev/null)" || fail "Could not list Resource Manager jobs."
+  token="$(jq -er -s '
+    if length != 1 then "E_DOCS"
     else
       .[0] as $document |
-      if ($document | type) == "object" and
-         ($document.data | type) == "array" and
-         all($document.data[];
-           type == "object" and
-           (.["id"] | type == "string" and length > 0) and
-           (.["lifecycle-state"] | type == "string" and (
-             . == "ACCEPTED" or . == "IN_PROGRESS" or . == "CANCELING" or
-             . == "SUCCEEDED" or . == "FAILED" or . == "CANCELED"
-           ))
-         )
-      then [$document.data[] | select(.["lifecycle-state"] == "ACCEPTED" or .["lifecycle-state"] == "IN_PROGRESS" or .["lifecycle-state"] == "CANCELING")] | length
-      else error("invalid job list")
+      if ($document | type) == "object" and ($document.data | type) == "array" then
+        if all($document.data[]; type == "object") then
+          if all($document.data[];
+               (.["id"] | type == "string" and length > 0) and
+               (.["lifecycle-state"] | type == "string")) then
+            if all($document.data[];
+                 .["lifecycle-state"] == "ACCEPTED" or
+                 .["lifecycle-state"] == "IN_PROGRESS" or
+                 .["lifecycle-state"] == "CANCELING" or
+                 .["lifecycle-state"] == "SUCCEEDED" or
+                 .["lifecycle-state"] == "FAILED" or
+                 .["lifecycle-state"] == "CANCELED") then
+              "OK \([ $document.data[] |
+                select(.["lifecycle-state"] == "ACCEPTED" or
+                       .["lifecycle-state"] == "IN_PROGRESS" or
+                       .["lifecycle-state"] == "CANCELING") ] | length)"
+            else "E_STATE"
+            end
+          else "E_ROW"
+          end
+        else "E_ROW"
+        end
+      else "E_SHAPE"
       end
     end
-  ' 2>/dev/null <<<"$jobs")" || fail "Could not validate Resource Manager job list."
-  [[ "$active_count" =~ ^[0-9]+$ ]] || fail "Could not validate Resource Manager job list."
+  ' 2>/dev/null <<<"$jobs")" || fail "Could not validate Resource Manager job list: parser failure."
+  case "$token" in
+    "OK "*) active_count="${token#OK }" ;;
+    E_DOCS) fail "Could not validate Resource Manager job list: expected exactly one JSON document." ;;
+    E_SHAPE) fail "Could not validate Resource Manager job list: invalid top-level shape." ;;
+    E_ROW) fail "Could not validate Resource Manager job list: malformed job row." ;;
+    E_STATE) fail "Could not validate Resource Manager job list: unrecognized lifecycle state." ;;
+    *) fail "Could not validate Resource Manager job list: parser failure." ;;
+  esac
+  [[ "$active_count" =~ ^[0-9]+$ ]] || fail "Could not validate Resource Manager job list: parser failure."
   (( active_count > 0 ))
 }
 
 ordered_job_history() {
   local stack_id="$1" jobs
-  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --limit "$PROVIDER_TIMEOUT_MAX_CONSECUTIVE" --sort-by TIMECREATED --sort-order DESC --output json 2>&1)" || return 1
+  jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --limit "$PROVIDER_TIMEOUT_MAX_CONSECUTIVE" --sort-by TIMECREATED --sort-order DESC --output json 2>/dev/null)" || return 1
   jq -e '.data | type == "array"' >/dev/null 2>/dev/null <<<"$jobs" || return 1
   printf '%s\n' "$jobs"
 }

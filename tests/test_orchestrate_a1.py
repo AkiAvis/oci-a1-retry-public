@@ -500,6 +500,8 @@ class OrchestrateA1TestCase(unittest.TestCase):
         state_failures=None,
         state_overrides=None,
         job_list_outputs=None,
+        job_list_stderr=None,
+        job_get_stderr=None,
         extra_env=None,
         script_text=None,
     ):
@@ -514,6 +516,8 @@ class OrchestrateA1TestCase(unittest.TestCase):
         state_failures = state_failures or {}
         state_overrides = state_overrides or {}
         job_list_outputs = job_list_outputs or {}
+        job_list_stderr = job_list_stderr or {}
+        job_get_stderr = job_get_stderr or {}
 
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp_dir:
             temp = Path(temp_dir)
@@ -534,6 +538,8 @@ class OrchestrateA1TestCase(unittest.TestCase):
                         "state_failures": state_failures,
                         "state_overrides": state_overrides,
                         "job_list_outputs": job_list_outputs,
+                        "job_list_stderr": job_list_stderr,
+                        "job_get_stderr": job_get_stderr,
                     }
                 )
             )
@@ -570,6 +576,8 @@ class OrchestrateA1TestCase(unittest.TestCase):
 
                     if args[:3] == ["resource-manager", "job", "list"]:
                         stack_id = option("--stack-id")
+                        if config["job_list_stderr"].get(stack_id):
+                            print(config["job_list_stderr"][stack_id], file=sys.stderr)
                         if stack_id in config["job_list_outputs"] and "--all" in args:
                             print(config["job_list_outputs"][stack_id], end="")
                             raise SystemExit(0)
@@ -583,6 +591,8 @@ class OrchestrateA1TestCase(unittest.TestCase):
                         print(json.dumps(dict(data=jobs), separators=(",", ":")))
                     elif args[:3] == ["resource-manager", "job", "get"]:
                         job_id = option("--job-id")
+                        if config["job_get_stderr"].get(job_id):
+                            print(config["job_get_stderr"][job_id], file=sys.stderr)
                         if config["state_failures"].get(job_id):
                             print("simulated state failure", file=sys.stderr)
                             raise SystemExit(9)
