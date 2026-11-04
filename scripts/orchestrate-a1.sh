@@ -44,7 +44,8 @@ has_active_job() {
   local stack_id="$1" jobs token active_count
   jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --all --output json 2>/dev/null)" || fail "Could not list Resource Manager jobs."
   token="$(jq -er -s '
-    if length != 1 then "E_DOCS"
+    if length == 0 then "OK 0"
+    elif length != 1 then "E_DOCS"
     else
       .[0] as $document |
       if ($document | type) == "object" and ($document.data | type) == "array" then
@@ -88,6 +89,12 @@ has_active_job() {
 ordered_job_history() {
   local stack_id="$1" jobs
   jobs="$("$OCI_BIN" resource-manager job list --stack-id "$stack_id" --limit "$PROVIDER_TIMEOUT_MAX_CONSECUTIVE" --sort-by TIMECREATED --sort-order DESC --output json 2>/dev/null)" || return 1
+  # OCI CLI 3.89.1 renders nothing at all for an empty result list (data is only
+  # printed when truthy), so an empty stdout is the documented shape of "no jobs".
+  if [[ -z "${jobs//[[:space:]]/}" ]]; then
+    printf '%s\n' '{"data": []}'
+    return 0
+  fi
   jq -e '.data | type == "array"' >/dev/null 2>/dev/null <<<"$jobs" || return 1
   printf '%s\n' "$jobs"
 }
