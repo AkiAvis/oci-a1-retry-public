@@ -500,6 +500,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         state_failures=None,
         state_overrides=None,
         job_list_outputs=None,
+        job_history_outputs=None,
         job_list_stderr=None,
         job_get_stderr=None,
         extra_env=None,
@@ -516,6 +517,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
         state_failures = state_failures or {}
         state_overrides = state_overrides or {}
         job_list_outputs = job_list_outputs or {}
+        job_history_outputs = job_history_outputs or {}
         job_list_stderr = job_list_stderr or {}
         job_get_stderr = job_get_stderr or {}
 
@@ -538,6 +540,7 @@ class OrchestrateA1TestCase(unittest.TestCase):
                         "state_failures": state_failures,
                         "state_overrides": state_overrides,
                         "job_list_outputs": job_list_outputs,
+                        "job_history_outputs": job_history_outputs,
                         "job_list_stderr": job_list_stderr,
                         "job_get_stderr": job_get_stderr,
                     }
@@ -580,6 +583,9 @@ class OrchestrateA1TestCase(unittest.TestCase):
                             print(config["job_list_stderr"][stack_id], file=sys.stderr)
                         if stack_id in config["job_list_outputs"] and "--all" in args:
                             print(config["job_list_outputs"][stack_id], end="")
+                            raise SystemExit(0)
+                        if stack_id in config["job_history_outputs"] and "--sort-by" in args:
+                            print(config["job_history_outputs"][stack_id], end="")
                             raise SystemExit(0)
                         jobs = config["jobs"].get(stack_id, [])
                         if "--sort-by" in args:
@@ -3216,6 +3222,92 @@ class OrchestrateA1ProviderTimeoutTests(OrchestrateA1TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no Apply was started", result.stdout)
         self.assertEqual(len(creates), 1)
+
+
+class OrchestrateA1EmptyJobListTests(OrchestrateA1TestCase):
+    """Pinned OCI CLI 3.89.1 renders nothing at all when a result list is empty.
+
+    ``cli_util.render`` only echoes when ``display_dictionary`` is non-empty and
+    ``data`` is added only ``if data:``, so a successful call on a stack with no
+    jobs exits 0 with an empty stdout. That is an empty job list, not a parse
+    error; a failure, malformed JSON or several documents must still stop.
+    """
+
+    DOCS_MESSAGE = "Could not validate Resource Manager job list: expected exactly one JSON document."
+    PARSER_MESSAGE = "Could not validate Resource Manager job list: parser failure."
+
+    def test_successful_cli_with_empty_job_lists_proceeds_to_create(self):
+        result, calls = self.run_orchestrator(
+            job_list_outputs={"stack-core": "", "stack-small-01": "", "stack-small-02": ""}
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][4], "stack-core")
+
+    def test_single_stack_with_empty_job_list_does_not_stop_the_run(self):
+        result, calls = self.run_orchestrator(job_list_outputs={"stack-small-02": ""})
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][4], "stack-core")
+
+    def test_whitespace_only_output_counts_as_an_empty_job_list(self):
+        result, calls = self.run_orchestrator(
+            job_list_outputs={
+                "stack-core": "\n \n",
+                "stack-small-01": "\t\n",
+                "stack-small-02": "",
+            }
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(creates[0][4], "stack-core")
+
+    def test_empty_history_for_a_new_stack_allows_small02_creation(self):
+        result, calls = self.run_orchestrator(
+            inventory={"data": [_instance("hermes-a1-small-01", 1, 6)]},
+            job_list_outputs={"stack-small-02": ""},
+            job_history_outputs={"stack-small-02": ""},
+            create={
+                "stack-small-02": {
+                    "id": "job-small02-new",
+                    "state": "SUCCEEDED",
+                    "logs": "",
+                }
+            },
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][4], "stack-small-02")
+
+    def test_empty_output_is_not_confused_with_multiple_documents(self):
+        result, calls = self.run_orchestrator(
+            job_list_outputs={"stack-core": '{"data": []}\n{"data": []}'}
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn(self.DOCS_MESSAGE, result.stderr)
+
+    def test_empty_output_is_not_confused_with_malformed_json(self):
+        result, calls = self.run_orchestrator(job_list_outputs={"stack-core": "not-json"})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn(self.PARSER_MESSAGE, result.stderr)
+
+    def test_failed_cli_still_stops_before_any_apply(self):
+        result, calls = self.run_orchestrator(extra_env={"OCI_BIN": "/bin/false"})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn("Could not list Resource Manager jobs.", result.stderr)
 
 
 if __name__ == "__main__":
