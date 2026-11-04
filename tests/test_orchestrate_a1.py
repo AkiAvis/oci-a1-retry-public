@@ -3370,5 +3370,56 @@ class OrchestrateA1ProviderNoticeTests(OrchestrateA1TestCase):
         self.assertFalse(self.create_calls(calls))
         self.assertIn("diagnostic=unknown", result.stderr)
 
+class OrchestrateA1ProviderSigningNoticeTests(OrchestrateA1TestCase):
+    """Terraform's provider-signing notice must not turn a capacity failure into "unknown"."""
+
+    SIGNING_NOTICE = "\n".join(
+        [
+            "2026/08/07 14:26:11\tINFO\tPartner and community providers are signed by their developers.",
+            "2026/08/07 14:26:11\tINFO\tIf you'd like to know more about provider signing, you can read about it here:",
+            "2026/08/07 14:26:11\tINFO\thttps://www.terraform.io/docs/cli/plugins/signing.html",
+        ]
+    )
+
+    def _capacity_log_with_signing_notice(self):
+        anchor = "2026/10/26 17:09:29\tINFO\tTerraform has been successfully initialized!"
+        return CAPACITY_LOG.replace(anchor, self.SIGNING_NOTICE + "\n" + anchor)
+
+    def test_signing_notice_keeps_the_capacity_verdict(self):
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-signing", logs=self._capacity_log_with_signing_notice())]}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.create_calls(calls)), 1)
+        self.assertIn("diagnostic=capacity", result.stderr)
+
+    def test_signing_notice_in_small_history_allows_the_retry(self):
+        result, calls = self.run_orchestrator(
+            jobs={
+                "stack-core": [_job("job-core-old", logs=CAPACITY_LOG)],
+                "stack-small-01": [_job("job-small-old", logs=self._capacity_log_with_signing_notice())],
+            },
+            create={
+                "stack-core": {"id": "job-core-new", "state": "FAILED", "logs": CAPACITY_LOG},
+                "stack-small-01": {"id": "job-small-new", "state": "SUCCEEDED", "logs": ""},
+            },
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(creates[-1][4], "stack-small-01")
+
+    def test_altered_signing_wording_still_stops(self):
+        logs = self._capacity_log_with_signing_notice().replace(
+            "Partner and community providers are signed by their developers.",
+            "Partner and community providers are signed by their developer.",
+        )
+        result, calls = self.run_orchestrator(jobs={"stack-core": [_job("job-signing", logs=logs)]})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn("diagnostic=unknown", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()
