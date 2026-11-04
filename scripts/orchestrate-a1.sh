@@ -436,6 +436,11 @@ classify_failure_records() {
           message ~ /^-[[:space:]]+[A-Za-z0-9_.-]+[/][A-Za-z0-9_.-]+$/) {
         return 1
       }
+      if (message == "Partner and community providers are signed by their developers." ||
+          message == "If you\047d like to know more about provider signing, you can read about it here:" ||
+          message == "https://www.terraform.io/docs/cli/plugins/signing.html") {
+        return 1
+      }
       if (message ~ /^Terraform has created a lock file[[:space:]]+[^[:space:]]+[[:space:]]+to record the provider$/ ||
           message == "selections it made above. Include this file in your version control repository" ||
           message == "so that Terraform can guarantee to make the same selections by default when" ||
