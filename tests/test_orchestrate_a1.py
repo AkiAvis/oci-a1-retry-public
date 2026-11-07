@@ -3421,5 +3421,42 @@ class OrchestrateA1ProviderSigningNoticeTests(OrchestrateA1TestCase):
         self.assertFalse(self.create_calls(calls))
         self.assertIn("diagnostic=unknown", result.stderr)
 
+class OrchestrateA1CoreOnlyModeTests(OrchestrateA1TestCase):
+    """SMALL_FALLBACK_ENABLED=0 keeps the core attempt but never starts a small Apply."""
+
+    def test_core_only_mode_stops_after_a_core_capacity_failure(self):
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-old", logs=CAPACITY_LOG)]},
+            create={"stack-core": {"id": "job-core-new", "state": "FAILED", "logs": CAPACITY_LOG}},
+            extra_env={"SMALL_FALLBACK_ENABLED": "0"},
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][4], "stack-core")
+        self.assertIn("small fallback is disabled", result.stdout)
+        self.assertNotIn("Started small-01", result.stdout)
+
+    def test_default_mode_still_starts_the_small01_fallback(self):
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-old", logs=CAPACITY_LOG)]},
+            create={"stack-core": {"id": "job-core-new", "state": "FAILED", "logs": CAPACITY_LOG},
+                    "stack-small-01": {"id": "job-small-new", "state": "SUCCEEDED", "logs": ""}},
+        )
+
+        creates = self.create_calls(calls)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(creates[-1][4], "stack-small-01")
+
+    def test_invalid_switch_value_fails_closed(self):
+        result, calls = self.run_orchestrator(
+            extra_env={"SMALL_FALLBACK_ENABLED": "yes"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.create_calls(calls))
+        self.assertIn("SMALL_FALLBACK_ENABLED must be 0 or 1", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()
