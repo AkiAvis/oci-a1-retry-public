@@ -1128,7 +1128,7 @@ wait_for_terminal() {
 
 failure_is_capacity() {
   local job_id="$1" logs parser_rc classification
-  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" --output json --query data --raw-output 2>&1)" || fail "Could not read failed-job logs."
+  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$job_id" --output json --query data --raw-output)" || fail "Could not read failed-job logs."
   grep -Fqi 'Out of host capacity' <<<"$logs" || return 1
   if core_mixed_serious_error_present "$logs"; then
     return 1
