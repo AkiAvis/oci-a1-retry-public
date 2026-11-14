@@ -17,6 +17,7 @@ CORE_NAME="${CORE_NAME:-hermes-core-01}"
 SMALL_01_NAME="${SMALL_01_NAME:-hermes-a1-small-01}"
 SMALL_02_NAME="${SMALL_02_NAME:-hermes-a1-small-02}"
 PROVIDER_TIMEOUT_MAX_CONSECUTIVE=3
+SMALL_FALLBACK_ENABLED="${SMALL_FALLBACK_ENABLED:-1}"
 CREATED_JOB_ID=""
 
 fail() {
@@ -25,6 +26,7 @@ fail() {
 }
 
 [[ "$CREATE_JOB_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || fail "CREATE_JOB_MAX_ATTEMPTS must be a positive integer."
+[[ "$SMALL_FALLBACK_ENABLED" =~ ^[01]$ ]] || fail "SMALL_FALLBACK_ENABLED must be 0 or 1."
 [[ "$CREATE_JOB_BACKOFF_SECONDS" =~ ^[1-9][0-9]*$ ]] || fail "CREATE_JOB_BACKOFF_SECONDS must be a positive integer."
 
 job_state() {
@@ -1195,6 +1197,14 @@ core_result="$(wait_for_terminal "$core_job_id")"
 [[ "$core_result" == SUCCEEDED ]] && exit 0
 [[ "$core_result" == FAILED ]] || fail "Core Apply did not succeed: $core_result"
 failure_is_capacity "$core_job_id" || fail "Core Apply failed for a reason other than host capacity; retry is stopped."
+
+# Core-only mode: keep the free-tier core attempt but skip the small fallback.
+# Used while the owner evaluates whether the small pair is worth the extra
+# management; the default keeps the existing core -> small-01 behaviour.
+if [[ "$SMALL_FALLBACK_ENABLED" != "1" ]]; then
+  echo "Core 2/12 failed for host capacity; small fallback is disabled, so no small-01 Apply was started. The next Cron run will retry core."
+  exit 0
+fi
 
 ensure_retry_allowed "$OCI_SMALL_01_STACK_ID" "small-01"
 create_apply_job_or_defer "$OCI_SMALL_01_STACK_ID" "small-01"
