@@ -941,7 +941,7 @@ provider_timeout_history_allows() {
 
     case "$listed_state" in
       FAILED)
-        logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$id" --output json --query data --raw-output 2>&1)" || stop_for_failure "$label" "$listed_state" "$id" log_unavailable
+        logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$id" --output json --query data --raw-output)" || stop_for_failure "$label" "$listed_state" "$id" log_unavailable
         classification="$(failure_classification "$logs" "$allow_provider_timeout")" || stop_for_failure "$label" "$listed_state" "$id" unknown
         echo "Observed $label Apply history: diagnostic=$classification state=$listed_state job=$(safe_job_id "$id")." >&2
         case "$classification" in
@@ -981,8 +981,13 @@ provider_timeout_history_allows() {
 core_capacity_history_allows() {
   local label="$1" expected_state="$2" latest="$3" logs parser_rc classification
 
-  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$latest" --output json --query data --raw-output 2>&1)" || stop_for_failure "$label" "$expected_state" "$latest" log_unavailable
-  grep -Fqi 'Out of host capacity' <<<"$logs" || stop_for_failure "$label" "$expected_state" "$latest" unknown
+  # Keep stdout and stderr separate: a CLI warning merged into the log text
+  # would otherwise be parsed as an unknown log record and stop the retry.
+  logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$latest" --output json --query data --raw-output)" || stop_for_failure "$label" "$expected_state" "$latest" log_unavailable
+  if ! grep -Fqi 'Out of host capacity' <<<"$logs"; then
+    echo "Core log check: capacity marker not found." >&2
+    stop_for_failure "$label" "$expected_state" "$latest" unknown
+  fi
   if core_mixed_serious_error_present "$logs"; then
     stop_for_failure "$label" "$expected_state" "$latest" mixed_serious_error
   else
@@ -992,7 +997,10 @@ core_capacity_history_allows() {
     1) ;;
     *) stop_for_failure "$label" "$expected_state" "$latest" core_safety_parser_failed ;;
   esac
-  classification="$(classify_failure_records "$logs")" || stop_for_failure "$label" "$expected_state" "$latest" unknown
+  if ! classification="$(classify_failure_records "$logs")"; then
+    echo "Core log check: log grammar rejected." >&2
+    stop_for_failure "$label" "$expected_state" "$latest" unknown
+  fi
   [[ "$classification" == capacity ]] || stop_for_failure "$label" "$expected_state" "$latest" unknown
   echo "Observed $label Apply history: diagnostic=capacity state=$expected_state job=$(safe_job_id "$latest")." >&2
   return 0

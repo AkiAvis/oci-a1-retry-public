@@ -3458,5 +3458,72 @@ class OrchestrateA1CoreOnlyModeTests(OrchestrateA1TestCase):
         self.assertFalse(self.create_calls(calls))
         self.assertIn("SMALL_FALLBACK_ENABLED must be 0 or 1", result.stderr)
 
+class CoreProvider912LogTests(OrchestrateA1TestCase):
+    """Real (sanitized) provider 9.12.0 core log replay and stderr isolation."""
+
+    LOG_PATH = Path(__file__).resolve().parent / "fixtures" / "core-provider-912.log"
+    LOG = LOG_PATH.read_text(encoding="utf-8")
+
+    def _core_only(self, log_override=None):
+        return self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-912", logs=self.LOG)]},
+            log_outputs=log_override or {},
+            create={"stack-core": {"id": "job-core-new", "state": "FAILED", "logs": self.LOG}},
+            extra_env={"SMALL_FALLBACK_ENABLED": "0"},
+        )
+
+    def test_provider_912_core_capacity_stops_after_core_in_core_only_mode(self):
+        result, calls = self._core_only()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("diagnostic=capacity", result.stderr)
+        self.assertIn("small fallback is disabled", result.stdout)
+        creates = self.create_calls(calls)
+        self.assertTrue(creates)
+        self.assertEqual(creates[0][4], "stack-core")
+        self.assertFalse(any("stack-small" in call[4] for call in creates))
+
+    def test_cli_stderr_warning_does_not_reject_the_capacity_log(self):
+        # The CLI writes warnings on stderr; merging them into the log text made
+        # every retry stop with diagnostic=unknown.
+        result, calls = self._core_only(
+            log_override={
+                "job-core-912": {
+                    "stdout": self.LOG,
+                    "stderr": "WARNING: These are the fingerprints of the API keys.\n",
+                }
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("diagnostic=capacity", result.stderr)
+
+    def test_missing_capacity_marker_still_stops(self):
+        without_marker = self.LOG.replace("Out of host capacity", "Out of capacity")
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-912", logs=without_marker)]},
+            extra_env={"SMALL_FALLBACK_ENABLED": "0"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("capacity marker not found", result.stderr)
+        self.assertFalse(self.create_calls(calls))
+
+    def test_unknown_record_in_capacity_block_still_stops(self):
+        injected = self.LOG.replace(
+            "[TERRAFORM_CONSOLE] [ERROR] Error: 500-InternalError, Out of host capacity.",
+            "[TERRAFORM_CONSOLE] [ERROR] Error: 500-InternalError, Out of host capacity.\n"
+            "2026/11/09 12:10:28[TERRAFORM_CONSOLE] [INFO] unrecognized provider notice",
+        )
+        result, calls = self.run_orchestrator(
+            jobs={"stack-core": [_job("job-core-912", logs=injected)]},
+            extra_env={"SMALL_FALLBACK_ENABLED": "0"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("log grammar rejected", result.stderr)
+        self.assertFalse(self.create_calls(calls))
+
+
 if __name__ == "__main__":
     unittest.main()
