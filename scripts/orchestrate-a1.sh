@@ -985,7 +985,7 @@ core_capacity_history_allows() {
   # would otherwise be parsed as an unknown log record and stop the retry.
   logs="$("$OCI_BIN" resource-manager job get-job-logs-content --job-id "$latest" --output json --query data --raw-output)" || stop_for_failure "$label" "$expected_state" "$latest" log_unavailable
   if ! grep -Fqi 'Out of host capacity' <<<"$logs"; then
-    echo "Core log check: capacity marker not found." >&2
+    printf 'Core log check: capacity marker not found (chars=%s lines=%s).\n' "${#logs}" "$(printf '%s' "$logs" | wc -l)" >&2
     stop_for_failure "$label" "$expected_state" "$latest" unknown
   fi
   if core_mixed_serious_error_present "$logs"; then
